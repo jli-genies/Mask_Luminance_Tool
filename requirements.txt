@@ -1,0 +1,11 @@
+# Direct third-party dependencies for matte_luminance_blend.py and matte_luminance_ui.py.
+#
+# genies (from ../genies-shared-python-packages) is not listed here since it's a local,
+# editable install and not published to an index. Set it up with:
+#   pip install -e "C:\Users\auror\Documents\Github\genies-shared-python-packages"
+# That also pulls in genies' own numpy/opencv-python/trimesh/scipy/pillow versions,
+# so install genies FIRST, then this file, to avoid pip re-resolving them.
+
+numpy==1.26.4
+opencv-python==4.11.0.86
+PyQt6==6.11.0
