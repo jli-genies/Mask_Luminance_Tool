@@ -1,29 +1,27 @@
 """Build a luminance-delta blend mask and optionally correct a sample albedo.
 
-Compares a sample UV texture against a flat diffuse reference (UV map or
-palette image), marks pixels whose luminance differs by more than a threshold,
-softens that mask with a blending radius, then softens the sample via local
-blur inside the mask. Diffuse is a comparison reference only by default
-(optional ``concept_diffuse_mix`` can blend toward it).
+Any number of independent *mask channels* can be layered onto a sample
+texture. Each channel picks one mask image from ``masks/`` (or elsewhere),
+a gate mode describing how that image selects pixels, and its own
+threshold / blur radius / diffuse strength / diffuse mix. Channels run in
+order, each correcting the output of the previous one, all through the same
+core algorithm: a soft luminance-delta mask (vs a diffuse target), feathered
+by a blur radius, then repainted via in_fill (nearest surrounding colors) or
+a local blur, optionally mixed toward the diffuse target.
 
-Typical use (UV diffuse of the same layout)::
+The diffuse target defaults to ``self`` mode: a flat skin color sampled from
+the sample texture's own clean pixels (those outside every enabled channel's
+gate and outside the feature-preserve mask), so no separate diffuse asset is
+required.
+
+Typical use::
 
     python matte_luminance_blend.py \\
         --texture african_female_0003_albedo_from_concept.png \\
-        --diffuse  african_female_0003_flat_diffuse.png \\
-        --region-mask mask_concept_texture.png \\
-        --threshold 12 --radius 8 --strength 0.85 \\
-        --out-mask  out/blend_mask.png \\
-        --out-texture out/albedo_matte.png
-
-Palette mode (multiview flat render; samples mean non-background skin)::
-
-    python matte_luminance_blend.py \\
-        --texture albedo.png \\
-        --diffuse Cleaningtexture_005.png \\
-        --diffuse-mode palette \\
-        --region-mask mask_concept_texture.png \\
-        --out-mask blend_mask.png --out-texture albedo_matte.png
+        --channels-config channels.json \\
+        --feature-preserve-mask masks/head_extrapolation_mask.png \\
+        --out-texture out/albedo_matte.png \\
+        --out-masks-dir out/channel_masks
 """
 
 from __future__ import annotations
@@ -32,6 +30,7 @@ import argparse
 import json
 import logging
 import os
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -44,11 +43,73 @@ from genies.meshutils.shading.texture_utils import (
 logger = logging.getLogger(__name__)
 
 # Default ID colors from the authored region mask (quantized / approximate).
+# Used only by "color_id" gate-mode channels (e.g. mask_concept_texture.png).
 DEFAULT_REGION_PALETTE: Dict[str, Tuple[int, int, int]] = {
     "forehead": (200, 16, 120),   # magenta
     "jaw_cheeks": (232, 232, 232),  # white / light grey
     "back_head": (56, 200, 248),  # cyan
 }
+
+GATE_MODES = ("weight", "blue_paint", "color_id")
+
+
+# =============================================================================
+# MASK CHANNEL CONFIG
+# =============================================================================
+@dataclass
+class MaskChannel:
+    """One independently controllable mask-driven correction pass.
+
+    Attributes:
+        name: Display / output name. Defaults to the mask filename stem.
+        mask_path: Path to the mask image driving this channel.
+        enabled: Whether this channel runs at all.
+        gate_mode: How ``mask_path`` selects pixels —
+            "weight": grayscale luminance/255 as a soft gate (default).
+            "blue_paint": blue-dominant paint on a UV map marks the gate
+                (e.g. body_mat_mask_C_highlights_00.png).
+            "color_id": ``mask_path`` is a multi-region ID color map;
+                ``regions``/``region_tolerance`` select which named regions
+                (from the palette) participate.
+        threshold: Minimum |luminance(sample) - luminance(diffuse_target)|
+            (0-255) before a gated pixel enters the mask.
+        radius: Gaussian sigma (px) used both to feather the mask and (when
+            not using infill) to locally blur the correction target.
+        strength: Overall blend-in amount of the correction (0-1).
+        diffuse_mix: Fraction of the correction target taken from the flat
+            diffuse target (0 = local blur/infill only, 1 = full diffuse).
+        use_infill: Build the correction target via in_fill (nearest
+            surrounding colors pushed into the masked region) instead of a
+            plain Gaussian blur. Default on, per the shared core algorithm.
+        spill_outside: Allow the feathered mask to spread into neighboring
+            pixels outside the gate rather than being re-clipped to it.
+        fill_holes: Only meaningful for gate_mode="weight". Flood-fills
+            enclosed holes in the mask (e.g. a face-oval cutout inside a
+            white ring) so the gate covers the full interior, not just the
+            painted ring.
+        regions: gate_mode="color_id" only — subset of palette region names
+            to include. None means all.
+        region_tolerance: gate_mode="color_id" only — RGB tolerance when
+            matching ID mask colors.
+    """
+
+    name: str
+    mask_path: str
+    enabled: bool = False
+    gate_mode: str = "weight"
+    threshold: float = 12.0
+    radius: float = 8.0
+    strength: float = 0.85
+    diffuse_mix: float = 0.0
+    use_infill: bool = True
+    spill_outside: bool = False
+    fill_holes: bool = False
+    regions: Optional[Sequence[str]] = None
+    region_tolerance: int = 40
+
+    def __post_init__(self) -> None:
+        if self.gate_mode not in GATE_MODES:
+            raise ValueError(f"Unknown gate_mode '{self.gate_mode}'. Known: {GATE_MODES}")
 
 
 # =============================================================================
@@ -137,15 +198,12 @@ def color_id_mask(
 
 
 def build_region_gate(
-    id_map: Optional[np.ndarray],
+    id_map: np.ndarray,
     palette: Dict[str, Tuple[int, int, int]],
     tolerance: int = 40,
     active: Optional[Sequence[str]] = None,
 ) -> np.ndarray:
-    """Union of selected ID regions. All-ones if no id_map is provided."""
-    if id_map is None:
-        return np.ones((), dtype=np.float32)  # broadcast later
-
+    """Union of selected ID regions."""
     gate = np.zeros(id_map.shape[:2], dtype=np.float32)
     names = list(active) if active else list(palette.keys())
     for name in names:
@@ -205,8 +263,7 @@ def make_diffuse_target(
 
     ``self`` mode (deriving the target from the sample itself rather than an
     external diffuse asset) is handled by ``sample_self_reference_skin_rgb``
-    in ``process()``, since it needs the concept/highlight/feature masks that
-    aren't available here.
+    in ``process()``, since it needs the union of enabled channel gates.
     """
     if mode == "uv":
         return resize_to(diffuse, sample.shape[:2], nearest=False).astype(np.float32)
@@ -223,28 +280,24 @@ def make_diffuse_target(
 def sample_self_reference_skin_rgb(
     sample: np.ndarray,
     exclude_gate: np.ndarray,
-    envelope: Optional[np.ndarray] = None,
     bg_threshold: float = 8.0,
 ) -> np.ndarray:
     """Estimates a flat skin RGB from the sample texture's own "clean" pixels.
 
-    Averages sample pixels that are inside ``envelope`` (if given) but
-    outside ``exclude_gate`` — typically the union of the concept ID
-    regions, the highlight paint, and the feature-preserve mask, i.e.
-    whatever has already been flagged as needing correction or as
-    non-skin (eyes/mouth). The remaining pixels are presumed-good mid-tone
-    skin sourced from the texture itself, sidestepping exposure/color
-    mismatches against a separately lit diffuse reference asset.
+    Averages sample pixels outside ``exclude_gate`` — the union of every
+    enabled channel's gate plus the feature-preserve mask, i.e. whatever has
+    already been flagged as needing correction or as non-skin (eyes/mouth).
+    The remaining pixels are presumed-good mid-tone skin sourced from the
+    texture itself, sidestepping exposure/color mismatches against a
+    separately lit diffuse reference asset.
     """
     lum = luminance(sample)
     keep = (lum > bg_threshold) & (exclude_gate <= 0.5)
-    if envelope is not None:
-        keep &= envelope > 0.5
     if not np.any(keep):
         raise ValueError(
             "Could not sample self-reference skin: nothing left outside the "
-            "concept/highlight/feature-preserve masks. Loosen those masks or "
-            "use --diffuse-mode uv/palette instead."
+            "enabled channel masks / feature-preserve mask. Loosen those masks "
+            "or use --diffuse-mode uv/palette instead."
         )
     skin = sample[keep].astype(np.float32)
     mean = skin.mean(axis=0)
@@ -256,13 +309,75 @@ def sample_self_reference_skin_rgb(
 
 
 # =============================================================================
+# GATES (per mask channel)
+# =============================================================================
+def composite_weights(mask_img: np.ndarray) -> np.ndarray:
+    """Grayscale gate weights in [0, 1] from a mask image."""
+    return (luminance(mask_img) / 255.0).astype(np.float32)
+
+
+def composite_skin_envelope(
+    mask_img: np.ndarray,
+    support_min: float = 1.0 / 255.0,
+) -> np.ndarray:
+    """Grayscale gate including enclosed holes (e.g. a face oval cutout).
+
+    Some masks paint a ring around the region of interest with a hole in the
+    middle (e.g. the composite skin mask's face oval). Flood-fill identifies
+    those enclosed holes so the gate covers the full interior.
+    """
+    weights = composite_weights(mask_img)
+    binary = (weights >= support_min).astype(np.uint8)
+    if not np.any(binary):
+        return binary.astype(np.float32)
+
+    h, w = binary.shape
+    inv = (1 - binary).astype(np.uint8)
+    flood = inv.copy()
+    ff_mask = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.floodFill(flood, ff_mask, (0, 0), 2)
+    holes = (flood == 1).astype(np.float32)
+    return np.clip(binary.astype(np.float32) + holes, 0.0, 1.0)
+
+
+def extract_blue_paint_mask(
+    paint_map: np.ndarray,
+    min_blue: int = 100,
+    blue_margin: int = 40,
+) -> np.ndarray:
+    """Extracts a float gate from blue-painted areas on a UV paint map.
+
+    Pixels where blue dominates red/green (as in an authored highlight mask)
+    become 1; everything else 0.
+    """
+    r = paint_map[..., 0].astype(np.int16)
+    g = paint_map[..., 1].astype(np.int16)
+    b = paint_map[..., 2].astype(np.int16)
+    blue = (b >= min_blue) & (b > r + blue_margin) & (b > g + blue_margin)
+    return blue.astype(np.float32)
+
+
+def compute_channel_gate(
+    mask_img: np.ndarray,
+    channel: MaskChannel,
+    palette: Dict[str, Tuple[int, int, int]],
+) -> np.ndarray:
+    """Resolves one channel's gate (0-1 weights) from its mask image."""
+    if channel.gate_mode == "blue_paint":
+        return extract_blue_paint_mask(mask_img)
+    if channel.gate_mode == "color_id":
+        return build_region_gate(mask_img, palette, channel.region_tolerance, channel.regions)
+    return composite_skin_envelope(mask_img) if channel.fill_holes else composite_weights(mask_img)
+
+
+# =============================================================================
 # MASK + BLEND
 # =============================================================================
 def luminance_delta_mask(
     sample: np.ndarray,
     diffuse_target: np.ndarray,
     threshold: float,
-    region_gate: Optional[np.ndarray] = None,
+    gate: np.ndarray,
 ) -> np.ndarray:
     """Soft-threshold mask where |L_sample - L_diffuse| exceeds ``threshold``.
 
@@ -275,12 +390,7 @@ def luminance_delta_mask(
     # Soft ramp: full weight once delta is 2x the threshold past the cut.
     ramp = threshold if threshold > 1e-6 else 1.0
     weights = np.clip(over / ramp, 0.0, 1.0).astype(np.float32)
-
-    if region_gate is not None:
-        if region_gate.shape == ():
-            pass
-        else:
-            weights *= region_gate.astype(np.float32)
+    weights *= gate.astype(np.float32)
 
     # Ignore empty UV background (near-black on sample).
     bg = luminance(sample) < 8.0
@@ -295,68 +405,6 @@ def apply_blending_radius(mask: np.ndarray, radius: float) -> np.ndarray:
     # Kernel size odd and large enough for the sigma.
     k = int(max(3, round(radius * 6) // 2 * 2 + 1))
     return cv2.GaussianBlur(mask, (k, k), radius)
-
-
-# =============================================================================
-# COMPOSITE SKIN MASK (interior = diffuse, border = blur only)
-# =============================================================================
-def composite_weights(composite: np.ndarray) -> np.ndarray:
-    """Grayscale envelope weights in [0, 1] from a composite skin mask."""
-    return (luminance(composite) / 255.0).astype(np.float32)
-
-
-def composite_skin_envelope(
-    composite: np.ndarray,
-    support_min: float = 1.0 / 255.0,
-) -> np.ndarray:
-    """Skin envelope including interior holes (e.g. the face oval in the composite).
-
-    The composite map often has a black face hole surrounded by a white ring.
-    Flood-fill identifies those enclosed holes so diffuse can cover the full face
-    while still respecting a separate feature preserve mask.
-    """
-    weights = composite_weights(composite)
-    binary = (weights >= support_min).astype(np.uint8)
-    if not np.any(binary):
-        return binary.astype(np.float32)
-
-    h, w = binary.shape
-    inv = (1 - binary).astype(np.uint8)
-    flood = inv.copy()
-    ff_mask = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(flood, ff_mask, (0, 0), 2)
-    holes = (flood == 1).astype(np.float32)
-    return np.clip(binary.astype(np.float32) + holes, 0.0, 1.0)
-
-
-def split_composite_zones(
-    weights: np.ndarray,
-    interior_min: float = 250.0 / 255.0,
-    support_min: float = 1.0 / 255.0,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Split composite into full-white interior vs feathered border band.
-
-    Border band receives local blur only (seam softening at composite edges).
-    """
-    interior = (weights >= interior_min).astype(np.float32)
-    border = ((weights >= support_min) & (weights < interior_min)).astype(np.float32)
-    border = border * weights
-    return interior, border
-
-
-def mean_luminance_in_mask(
-    img: np.ndarray,
-    mask: np.ndarray,
-    bg_threshold: float = 8.0,
-) -> float:
-    """Mean Rec. 709 luminance of ``img`` where ``mask`` > 0 (ignoring UV background)."""
-    lum = luminance(img)
-    keep = (mask.astype(np.float32) > 0.01) & (lum >= bg_threshold)
-    if not np.any(keep):
-        keep = lum >= bg_threshold
-    if not np.any(keep):
-        return float(lum.mean())
-    return float(lum[keep].mean())
 
 
 def masked_gaussian_blur(
@@ -376,183 +424,7 @@ def masked_gaussian_blur(
     return num / np.maximum(den, 1e-4)
 
 
-def blend_toward_flat_luminance(
-    sample: np.ndarray,
-    target_l: float,
-    mask: np.ndarray,
-    strength: float,
-) -> np.ndarray:
-    """Blend sample luminance toward a single flat target; preserve original chroma."""
-    strength = float(np.clip(strength, 0.0, 1.0))
-    w = np.clip(mask.astype(np.float32) * strength, 0.0, 1.0)
-    sample_f = sample.astype(np.float32)
-    y_s, cb, cr = rgb_to_ycbcr(sample_f)
-    y_out = y_s * (1.0 - w) + float(target_l) * w
-    out = ycbcr_to_rgb(y_out, cb, cr)
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-def blend_luminance_from_masked_blur(
-    sample: np.ndarray,
-    blurred: np.ndarray,
-    mask: np.ndarray,
-    strength: float,
-) -> np.ndarray:
-    """Blend sample Y toward blurred Y; preserve original chroma."""
-    strength = float(np.clip(strength, 0.0, 1.0))
-    w = np.clip(mask.astype(np.float32) * strength, 0.0, 1.0)
-    sample_f = sample.astype(np.float32)
-    y_s, cb, cr = rgb_to_ycbcr(sample_f)
-    y_t = luminance(blurred)
-    y_out = y_s * (1.0 - w) + y_t * w
-    out = ycbcr_to_rgb(y_out, cb, cr)
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-def apply_composite_pass(
-    sample: np.ndarray,
-    diffuse_target: np.ndarray,
-    composite: np.ndarray,
-    radius: float,
-    diffuse_strength: float,
-    border_strength: float,
-    interior_min: float = 250.0 / 255.0,
-    luminance_only: bool = True,
-    feature_preserve: Optional[np.ndarray] = None,
-    highlight_preserve: Optional[np.ndarray] = None,
-    chin_mask: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Matte skin toward diffuse, following the composite mask's own gradient.
-
-    The composite mask is itself an authored feather (e.g. white face fading
-    to black at the chin/jaw), so the diffuse blend weight is the mask's
-    *continuous* grayscale value (softened by ``radius`` to remove authoring
-    grain) rather than a hard white-only threshold. This lets a feathered
-    edge still receive a proportional amount of flat-luminance correction
-    instead of none, which is what was leaving the chin dark and producing a
-    hard seam at the interior/border cutoff. A flat mean diffuse luminance
-    (not per-pixel UV colors) is used so misaligned diffuse maps do not paint
-    a warped / color-shifted pattern onto the face. A second, smaller local
-    blur still runs on the low-confidence fringe band to clean up residual
-    per-pixel grain right at the mask edge.
-
-    ``chin_mask`` (e.g. ``head_extrapolation_mask_chin_area.png``) extends
-    that border band: it marks an extra region that should receive the same
-    local-blur-only seam softening even where the composite mask's own
-    gradient has already fallen to zero (e.g. below the jaw, outside the
-    authored feather). It is unioned into the envelope too, so the border
-    blur has real neighboring content to average there instead of degrading
-    toward black; it is not added to the diffuse target, so it does not pull
-    in extra flat-luminance correction.
-    """
-    weights = composite_weights(composite)
-    envelope = composite_skin_envelope(composite)
-
-    chin_weights = composite_weights(chin_mask) if chin_mask is not None else None
-    if chin_weights is not None:
-        envelope = np.clip(envelope + (chin_weights > 1.0 / 255.0).astype(np.float32), 0.0, 1.0)
-
-    soft_weights = apply_blending_radius(weights, radius) if radius > 0 else weights
-    soft_weights = soft_weights * envelope
-
-    preserve = np.zeros_like(soft_weights)
-    if feature_preserve is not None:
-        preserve = np.maximum(preserve, composite_weights(feature_preserve))
-    if highlight_preserve is not None:
-        preserve = np.maximum(preserve, highlight_preserve.astype(np.float32))
-    diffuse_mask = soft_weights * (1.0 - np.clip(preserve, 0.0, 1.0))
-
-    working = sample
-    if float(diffuse_mask.max()) > 0.0:
-        target_l = mean_luminance_in_mask(diffuse_target, envelope)
-        logger.info("Composite flat target luminance ≈ %.1f", target_l)
-        working = blend_toward_flat_luminance(
-            working, target_l, diffuse_mask, diffuse_strength
-        )
-
-    _interior, border = split_composite_zones(weights, interior_min)
-    if chin_weights is not None:
-        border = np.maximum(border, chin_weights)
-    border_soft = apply_blending_radius(border, radius) if radius > 0 else border
-    if float(border_soft.max()) > 0.0:
-        blurred = masked_gaussian_blur(working, envelope, radius)
-        working = blend_luminance_from_masked_blur(
-            working, blurred, border_soft, border_strength
-        )
-
-    return working, diffuse_mask, border_soft
-
-
-def blend_toward_diffuse(
-    sample: np.ndarray,
-    diffuse_target: np.ndarray,
-    mask: np.ndarray,
-    strength: float,
-    luminance_only: bool = True,
-) -> np.ndarray:
-    """Blends sample toward diffuse_target using ``mask * strength``.
-
-    When ``luminance_only`` is True, only Y is blended (chroma preserved from
-    the sample) — preferred for matte albedo cleanup.
-    """
-    strength = float(np.clip(strength, 0.0, 1.0))
-    w = np.clip(mask.astype(np.float32) * strength, 0.0, 1.0)
-
-    sample_f = sample.astype(np.float32)
-    target_f = diffuse_target.astype(np.float32)
-
-    if luminance_only:
-        y_s, cb, cr = rgb_to_ycbcr(sample_f)
-        y_t = luminance(target_f)
-        y_out = y_s * (1.0 - w) + y_t * w
-        out = ycbcr_to_rgb(y_out, cb, cr)
-    else:
-        out = sample_f * (1.0 - w[..., None]) + target_f * w[..., None]
-
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-# =============================================================================
-# HIGHLIGHT BLUR (paint mask + luminance threshold → local blur, not diffuse)
-# =============================================================================
-def extract_blue_paint_mask(
-    paint_map: np.ndarray,
-    min_blue: int = 100,
-    blue_margin: int = 40,
-) -> np.ndarray:
-    """Extracts a float gate from blue-painted highlight areas on a UV paint map.
-
-    Pixels where blue dominates red/green (as in the authored highlight mask)
-    become 1; everything else 0.
-    """
-    r = paint_map[..., 0].astype(np.int16)
-    g = paint_map[..., 1].astype(np.int16)
-    b = paint_map[..., 2].astype(np.int16)
-    blue = (b >= min_blue) & (b > r + blue_margin) & (b > g + blue_margin)
-    return blue.astype(np.float32)
-
-
-def highlight_luminance_mask(
-    sample: np.ndarray,
-    highlight_gate: np.ndarray,
-    threshold: float,
-) -> np.ndarray:
-    """Soft mask of bright pixels inside the highlight paint gate.
-
-    Unlike the concept pass, this does **not** compare to a diffuse target.
-    Pixels with luminance above ``threshold`` (0-255) ramp into the mask;
-    outside the paint gate they stay 0.
-    """
-    lum = luminance(sample)
-    over = np.maximum(lum - threshold, 0.0)
-    ramp = max(threshold * 0.25, 8.0)  # soft shoulder above the cut
-    weights = np.clip(over / ramp, 0.0, 1.0).astype(np.float32)
-    weights *= highlight_gate.astype(np.float32)
-    weights[lum < 8.0] = 0.0
-    return weights
-
-
-def blur_highlights(
+def correct_region(
     sample: np.ndarray,
     mask: np.ndarray,
     radius: float,
@@ -560,26 +432,27 @@ def blur_highlights(
     diffuse_target: Optional[np.ndarray] = None,
     diffuse_mix: float = 0.0,
     luminance_only: bool = True,
-    use_infill: bool = False,
+    use_infill: bool = True,
 ) -> np.ndarray:
-    """Softens highlights using local blur and optional diffuse color mix.
+    """Softens masked pixels using local repaint and optional diffuse color mix.
 
     For each masked pixel, builds a correction target::
 
-        target = (1 - diffuse_mix) * blurred_sample + diffuse_mix * diffuse
+        target = (1 - diffuse_mix) * local_repaint + diffuse_mix * diffuse
 
-    then blends ``sample`` toward ``target`` by ``mask * strength``.
+    then blends ``sample`` toward ``target`` by ``mask * strength``. This is
+    the one shared core algorithm every mask channel runs through.
 
     Args:
         sample: Current albedo RGB.
-        mask: Soft highlight weights in [0, 1].
+        mask: Soft channel weights in [0, 1].
         radius: Gaussian sigma (px) for the local blur of ``sample``, or (when
             ``use_infill`` is set) the edge-softening radius after infill.
         strength: Overall mix amount of the correction (0-1).
         diffuse_target: Flat diffuse RGB (same size as sample). Required if
             ``diffuse_mix`` > 0.
         diffuse_mix: Fraction of the correction target taken from diffuse
-            (0 = local blur only, 1 = 100% diffuse color).
+            (0 = local repaint only, 1 = 100% diffuse color).
         luminance_only: Blend Y only (keep sample chroma).
         use_infill: Build the correction target by pushing the nearest
             surrounding (unmasked) colors into the masked region (see
@@ -587,7 +460,8 @@ def blur_highlights(
             A plain local blur only softens a bright/mismatched patch — its
             own color stays baked into the kernel average near the center —
             while infill actually replaces the patch with the surrounding
-            skin tone.
+            skin tone. This is the "core in_fill algorithm" shared by every
+            channel.
     """
     strength = float(np.clip(strength, 0.0, 1.0))
     diffuse_mix = float(np.clip(diffuse_mix, 0.0, 1.0))
@@ -595,22 +469,22 @@ def blur_highlights(
 
     sample_f = sample.astype(np.float32)
     if radius <= 0:
-        blurred = sample_f
+        repaint = sample_f
     elif use_infill:
         holes = mask.astype(np.float32) > 0.01
-        blurred = extend_texture_boundaries(sample_f, holes, max_distance=None)
-        blurred = apply_extrapolation_blur(blurred, holes, radius)
+        repaint = extend_texture_boundaries(sample_f, holes, max_distance=None)
+        repaint = apply_extrapolation_blur(repaint, holes, radius)
     else:
         k = int(max(3, round(radius * 6) // 2 * 2 + 1))
-        blurred = cv2.GaussianBlur(sample_f, (k, k), radius)
+        repaint = cv2.GaussianBlur(sample_f, (k, k), radius)
 
     if diffuse_mix <= 0.0 or diffuse_target is None:
-        target = blurred
+        target = repaint
     else:
         diff_f = diffuse_target.astype(np.float32)
         if diff_f.shape[:2] != sample_f.shape[:2]:
             diff_f = resize_to(diff_f, sample_f.shape[:2], nearest=False).astype(np.float32)
-        target = blurred * (1.0 - diffuse_mix) + diff_f * diffuse_mix
+        target = repaint * (1.0 - diffuse_mix) + diff_f * diffuse_mix
 
     if luminance_only:
         y_s, cb, cr = rgb_to_ycbcr(sample_f)
@@ -623,94 +497,87 @@ def blur_highlights(
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def apply_mask_channel(
+    working: np.ndarray,
+    diffuse_target: np.ndarray,
+    mask_img: np.ndarray,
+    channel: MaskChannel,
+    palette: Dict[str, Tuple[int, int, int]],
+    luminance_only: bool = True,
+    feature_preserve: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Runs one mask channel's full pass: gate -> threshold -> feather -> correct.
+
+    Returns the updated working texture and the channel's soft weight mask
+    (post-feather, pre-strength — useful for debug output).
+    """
+    gate = compute_channel_gate(mask_img, channel, palette)
+    if feature_preserve is not None:
+        gate = gate * (1.0 - np.clip(feature_preserve, 0.0, 1.0))
+
+    raw = luminance_delta_mask(working, diffuse_target, channel.threshold, gate)
+    soft = apply_blending_radius(raw, channel.radius)
+    if not channel.spill_outside:
+        soft = soft * gate
+    else:
+        soft = soft * (luminance(working) >= 8.0).astype(np.float32)
+
+    new_working = correct_region(
+        working,
+        soft,
+        channel.radius,
+        channel.strength,
+        diffuse_target=diffuse_target if channel.diffuse_mix > 0.0 else None,
+        diffuse_mix=channel.diffuse_mix,
+        luminance_only=luminance_only,
+        use_infill=channel.use_infill,
+    )
+    return new_working, soft
+
+
+# =============================================================================
+# TOP-LEVEL PROCESS
+# =============================================================================
 def process(
     texture_path: str,
-    diffuse_path: Optional[str],
-    out_mask_path: str,
+    channels: Sequence[MaskChannel],
     out_texture_path: Optional[str] = None,
-    region_mask_path: Optional[str] = None,
-    diffuse_mode: str = "uv",
-    threshold: float = 12.0,
-    radius: float = 8.0,
-    strength: float = 0.85,
-    region_tolerance: int = 40,
-    regions: Optional[Sequence[str]] = None,
+    diffuse_path: Optional[str] = None,
+    diffuse_mode: str = "self",
     region_palette: Optional[Dict[str, Tuple[int, int, int]]] = None,
     luminance_only: bool = True,
-    blur_outside_mask: bool = False,
-    use_infill: bool = False,
-    concept_diffuse_mix: float = 0.0,
-    highlight_mask_path: Optional[str] = None,
-    hl_threshold: float = 180.0,
-    hl_radius: float = 6.0,
-    hl_strength: float = 0.7,
-    hl_diffuse_mix: float = 0.0,
-    hl_blur_outside_mask: bool = False,
-    out_hl_mask_path: Optional[str] = None,
-    composite_mask_path: Optional[str] = None,
-    composite_interior_min: float = 250.0,
-    composite_interior_strength: float = 0.85,
-    composite_border_strength: float = 0.85,
-    composite_radius: float = 8.0,
     feature_preserve_path: Optional[str] = None,
-    chin_mask_path: Optional[str] = None,
-    exclude_highlights_from_diffuse: bool = True,
-    out_composite_border_path: Optional[str] = None,
-    out_composite_diffuse_path: Optional[str] = None,
+    out_masks_dir: Optional[str] = None,
 ) -> Dict[str, str]:
-    """Runs matte correction, optional composite pass, then highlight softening.
+    """Runs every enabled mask channel in order over ``texture_path``.
 
-    Concept pass: luminance-delta vs diffuse inside ID regions builds the
-    mask; the texture is softened toward a local blur of itself (diffuse is
-    not written into the result unless ``concept_diffuse_mix`` > 0).
-
-    Composite pass: filled skin envelope (including face interior) blends toward
-    diffuse, excluding feature preserve and highlight paint; feathered border
-    band gets local blur only for seam softening.
-
-    Highlight pass: inside blue paint mask, soften pixels brighter than
-    ``hl_threshold`` by blending toward local blur and/or diffuse color
-    (``hl_diffuse_mix`` controls the diffuse percentage of that target).
-
-    When ``blur_outside_mask`` is True, soft mask edges may spill into
-    neighboring (unpainted) pixels for **both** concept and highlight passes.
-    ``hl_blur_outside_mask`` can still force spill for highlights only.
-
-    ``use_infill`` swaps the concept/highlight correction target from a local
-    Gaussian blur to infill (nearest surrounding colors pushed into the
-    masked region, see ``in_fill.py``) for both passes. Default: off.
+    Each channel corrects the output of the previous one. The diffuse target
+    defaults to ``self`` mode: a flat skin color sampled from the texture's
+    own pixels outside every enabled channel's gate and outside the
+    feature-preserve mask.
     """
     sample = load_rgb(texture_path)
-
-    id_map = None
-    if region_mask_path:
-        id_map = resize_to(load_rgb(region_mask_path), sample.shape[:2], nearest=True)
-
     palette = region_palette or DEFAULT_REGION_PALETTE
-    gate = build_region_gate(id_map, palette, region_tolerance, regions)
-    if isinstance(gate, np.ndarray) and gate.shape == ():
-        gate = np.ones(sample.shape[:2], dtype=np.float32)
-    elif id_map is None:
-        gate = np.ones(sample.shape[:2], dtype=np.float32)
+    active = [ch for ch in channels if ch.enabled]
+
+    mask_imgs: Dict[str, np.ndarray] = {}
+    for ch in active:
+        nearest = ch.gate_mode in ("blue_paint", "color_id")
+        mask_imgs[ch.name] = resize_to(load_rgb(ch.mask_path), sample.shape[:2], nearest=nearest)
+
+    feature_preserve = None
+    if feature_preserve_path:
+        feature_preserve = composite_weights(
+            resize_to(load_rgb(feature_preserve_path), sample.shape[:2], nearest=False)
+        )
 
     if diffuse_mode == "self":
-        # Average the sample's own pixels outside whatever is already
-        # flagged as needing correction (concept regions), non-skin
-        # (feature preserve), or blown-out (highlight paint) — a flat
-        # target sourced from the texture itself rather than a separately
-        # lit/exposed diffuse asset.
-        exclude = gate.copy() if id_map is not None else np.zeros(sample.shape[:2], dtype=np.float32)
-        if highlight_mask_path:
-            hl_paint_ref = resize_to(load_rgb(highlight_mask_path), sample.shape[:2], nearest=True)
-            exclude = np.maximum(exclude, extract_blue_paint_mask(hl_paint_ref))
-        if feature_preserve_path:
-            feature_ref = resize_to(load_rgb(feature_preserve_path), sample.shape[:2], nearest=False)
-            exclude = np.maximum(exclude, composite_weights(feature_ref))
-        envelope_ref = None
-        if composite_mask_path:
-            composite_ref = resize_to(load_rgb(composite_mask_path), sample.shape[:2], nearest=False)
-            envelope_ref = composite_skin_envelope(composite_ref)
-        skin_rgb = sample_self_reference_skin_rgb(sample, exclude, envelope_ref)
+        exclude = np.zeros(sample.shape[:2], dtype=np.float32)
+        for ch in active:
+            exclude = np.maximum(exclude, compute_channel_gate(mask_imgs[ch.name], ch, palette))
+        if feature_preserve is not None:
+            exclude = np.maximum(exclude, feature_preserve)
+        skin_rgb = sample_self_reference_skin_rgb(sample, exclude)
         diffuse_target = np.empty(sample.shape, dtype=np.float32)
         diffuse_target[...] = skin_rgb
     else:
@@ -719,143 +586,26 @@ def process(
         diffuse_img = load_rgb(diffuse_path)
         diffuse_target = make_diffuse_target(sample, diffuse_img, diffuse_mode)
 
-    # Shared spill switch: one CLI flag covers all blur/feather passes.
-    spill_neighbors = bool(blur_outside_mask)
-
-    raw = luminance_delta_mask(sample, diffuse_target, threshold, gate)
-    soft = apply_blending_radius(raw, radius)
-    if not spill_neighbors:
-        soft = soft * gate
-    else:
-        soft = soft * (luminance(sample) >= 8.0).astype(np.float32)
-
-    mask_u8 = np.clip(soft * 255.0, 0, 255).astype(np.uint8)
-    save_rgb(out_mask_path, mask_u8)
-    logger.info(
-        "Wrote concept blend mask -> %s  (active px: %.1f%%)",
-        out_mask_path,
-        100.0 * float((soft > 0.01).mean()),
-    )
-
-    results: Dict[str, str] = {"mask": out_mask_path}
-
     working = sample
-    if out_texture_path or highlight_mask_path:
-        # Diffuse drives the mask only; correction is local blur unless an
-        # explicit concept_diffuse_mix pulls toward the flat reference.
-        working = blur_highlights(
-            sample,
-            soft,
-            radius,
-            strength,
-            diffuse_target=diffuse_target if concept_diffuse_mix > 0.0 else None,
-            diffuse_mix=concept_diffuse_mix,
-            luminance_only=luminance_only,
-            use_infill=use_infill,
+    channel_masks: Dict[str, np.ndarray] = {}
+    for ch in active:
+        working, soft = apply_mask_channel(
+            working, diffuse_target, mask_imgs[ch.name], ch, palette, luminance_only, feature_preserve,
         )
+        channel_masks[ch.name] = soft
         logger.info(
-            "Applied concept soften (threshold=%.1f, radius=%.1f, "
-            "strength=%.2f, diffuse_mix=%.0f%%, infill=%s)",
-            threshold, radius, strength, 100.0 * concept_diffuse_mix, use_infill,
+            "Applied channel '%s' (gate=%s, threshold=%.1f, radius=%.1f, strength=%.2f, "
+            "diffuse_mix=%.0f%%, infill=%s, active px=%.1f%%)",
+            ch.name, ch.gate_mode, ch.threshold, ch.radius, ch.strength,
+            100.0 * ch.diffuse_mix, ch.use_infill, 100.0 * float((soft > 0.01).mean()),
         )
 
-    # --- Composite pass (envelope = diffuse, border = blur) ----------------
-    composite_border_soft = np.zeros(sample.shape[:2], dtype=np.float32)
-    composite_diffuse_mask = np.zeros(sample.shape[:2], dtype=np.float32)
-    if composite_mask_path:
-        composite = resize_to(load_rgb(composite_mask_path), sample.shape[:2], nearest=False)
-        interior_min = float(np.clip(composite_interior_min, 0.0, 255.0)) / 255.0
-
-        feature_preserve = None
-        if feature_preserve_path:
-            feature_preserve = resize_to(
-                load_rgb(feature_preserve_path), sample.shape[:2], nearest=False
-            )
-
-        chin_mask = None
-        if chin_mask_path:
-            chin_mask = resize_to(
-                load_rgb(chin_mask_path), sample.shape[:2], nearest=False
-            )
-
-        hl_gate_for_diffuse = None
-        if exclude_highlights_from_diffuse and highlight_mask_path:
-            hl_paint = resize_to(load_rgb(highlight_mask_path), sample.shape[:2], nearest=True)
-            hl_gate_for_diffuse = extract_blue_paint_mask(hl_paint)
-
-        if out_texture_path or highlight_mask_path or out_composite_border_path or out_composite_diffuse_path:
-            working, composite_diffuse_mask, composite_border_soft = apply_composite_pass(
-                working,
-                diffuse_target,
-                composite,
-                composite_radius,
-                composite_interior_strength,
-                composite_border_strength,
-                interior_min=interior_min,
-                luminance_only=luminance_only,
-                feature_preserve=feature_preserve,
-                highlight_preserve=hl_gate_for_diffuse,
-                chin_mask=chin_mask,
-            )
-            logger.info(
-                "Applied composite pass (envelope→diffuse minus preserve, border blur "
-                "radius=%.1f, diffuse=%.2f, border=%.2f)",
-                composite_radius,
-                composite_interior_strength,
-                composite_border_strength,
-            )
-        if out_composite_diffuse_path:
-            save_rgb(
-                out_composite_diffuse_path,
-                np.clip(composite_diffuse_mask * 255.0, 0, 255).astype(np.uint8),
-            )
-            logger.info("Wrote composite diffuse mask -> %s", out_composite_diffuse_path)
-            results["composite_diffuse"] = out_composite_diffuse_path
-        if out_composite_border_path:
-            save_rgb(
-                out_composite_border_path,
-                np.clip(composite_border_soft * 255.0, 0, 255).astype(np.uint8),
-            )
-            logger.info("Wrote composite border mask -> %s", out_composite_border_path)
-            results["composite_border"] = out_composite_border_path
-
-    # --- Highlight blur pass -------------------------------------------------
-    if highlight_mask_path:
-        paint = resize_to(load_rgb(highlight_mask_path), working.shape[:2], nearest=True)
-        hl_gate = extract_blue_paint_mask(paint)
-        hl_raw = highlight_luminance_mask(working, hl_gate, hl_threshold)
-        hl_soft = apply_blending_radius(hl_raw, hl_radius)
-        # Same neighbor-spill policy as concept, unless highlight-only override.
-        hl_spill = spill_neighbors or bool(hl_blur_outside_mask)
-        if not hl_spill:
-            hl_soft = hl_soft * hl_gate
-        else:
-            hl_soft = hl_soft * (luminance(working) >= 8.0).astype(np.float32)
-
-        if out_hl_mask_path:
-            save_rgb(out_hl_mask_path, np.clip(hl_soft * 255.0, 0, 255).astype(np.uint8))
-            logger.info(
-                "Wrote highlight blur mask -> %s  (active px: %.1f%%)",
-                out_hl_mask_path,
-                100.0 * float((hl_soft > 0.01).mean()),
-            )
-            results["hl_mask"] = out_hl_mask_path
-
-        working = blur_highlights(
-            working,
-            hl_soft,
-            hl_radius,
-            hl_strength,
-            diffuse_target=diffuse_target,
-            diffuse_mix=hl_diffuse_mix,
-            luminance_only=luminance_only,
-            use_infill=use_infill,
-        )
-        logger.info(
-            "Applied highlight soften (threshold=%.1f, radius=%.1f, "
-            "strength=%.2f, diffuse_mix=%.0f%%, infill=%s)",
-            hl_threshold, hl_radius, hl_strength, 100.0 * hl_diffuse_mix, use_infill,
-        )
+    results: Dict[str, str] = {}
+    if out_masks_dir:
+        for name, soft in channel_masks.items():
+            path = os.path.join(out_masks_dir, f"{name}_mask.png")
+            save_rgb(path, np.clip(soft * 255.0, 0, 255).astype(np.uint8))
+            results[f"mask:{name}"] = path
 
     if out_texture_path:
         save_rgb(out_texture_path, working)
@@ -868,200 +618,62 @@ def process(
 # =============================================================================
 # CLI
 # =============================================================================
+def _channels_from_json(path: str) -> List[MaskChannel]:
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    return [MaskChannel(**c) for c in raw]
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Luminance-delta blend mask (+ optional matte correction) "
-                    "between a sample albedo and a flat diffuse reference.",
+        description="Layered mask-channel luminance correction for a sample albedo.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument("--texture", required=True, help="Sample albedo UV texture.")
     parser.add_argument(
+        "--channels-config",
+        required=True,
+        help="JSON file: a list of mask-channel objects, each matching the "
+             "MaskChannel fields (name, mask_path, enabled, gate_mode, "
+             "threshold, radius, strength, diffuse_mix, use_infill, "
+             "spill_outside, fill_holes, regions, region_tolerance).",
+    )
+    parser.add_argument(
         "--diffuse",
         default=None,
         help="Flat diffuse UV (mode=uv) or multiview/palette flat render (mode=palette). "
-             "Not needed when --diffuse-mode self.",
+             "Not needed when --diffuse-mode self (the default).",
     )
     parser.add_argument(
         "--diffuse-mode",
         choices=("uv", "palette", "self"),
-        default="uv",
-        help="How to interpret --diffuse. 'self' ignores --diffuse and instead averages "
-             "the sample texture's own pixels outside the concept/highlight/feature-preserve "
-             "masks as the flat target. Default: uv.",
+        default="self",
+        help="How to build the diffuse target. 'self' (default) averages the sample "
+             "texture's own pixels outside every enabled channel's gate and the "
+             "feature-preserve mask.",
     )
     parser.add_argument(
-        "--region-mask",
+        "--feature-preserve-mask",
         default=None,
-        help="Optional color ID mask; limits correction to painted regions.",
-    )
-    parser.add_argument(
-        "--regions",
-        nargs="+",
-        default=None,
-        help=f"Subset of ID regions to use. Default: all. Known: {sorted(DEFAULT_REGION_PALETTE)}",
-    )
-    parser.add_argument(
-        "--region-tolerance",
-        type=int,
-        default=40,
-        help="RGB tolerance when matching ID mask colors. Default: 40.",
-    )
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=12.0,
-        help="Min |dLuminance| (0-255) before a pixel enters the blend mask. Default: 12.",
-    )
-    parser.add_argument(
-        "--radius",
-        type=float,
-        default=8.0,
-        help="Blending radius: Gaussian sigma in pixels applied to the mask. Default: 8.",
-    )
-    parser.add_argument(
-        "--strength",
-        type=float,
-        default=0.85,
-        help="Blending strength of the concept soften once masked (0-1). Default: 0.85.",
-    )
-    parser.add_argument(
-        "--concept-diffuse-mix",
-        type=float,
-        default=0.0,
-        help="Fraction of concept correction target taken from diffuse "
-             "(0=local blur only — default; 1=bake flat diffuse). Default: 0.",
+        help="Grayscale mask: bright areas (eyes/mouth/etc.) are protected from every "
+             "channel's correction and excluded from self-mode skin sampling.",
     )
     parser.add_argument(
         "--full-rgb",
         action="store_true",
         help="Blend full RGB instead of luminance-only (chroma may shift).",
     )
+    parser.add_argument("--out-texture", default=None, help="Optional corrected albedo path.")
     parser.add_argument(
-        "--blur-outside-mask",
-        action="store_true",
-        help="Allow soft blur/feather to spill into neighboring unpainted pixels "
-             "for BOTH the concept pass (--radius) and the highlight pass "
-             "(--hl-radius). Default: re-clip each pass to its painted mask.",
-    )
-    parser.add_argument(
-        "--use-infill",
-        action="store_true",
-        help="Build the concept/highlight correction target by pushing nearest "
-             "surrounding colors into the masked region (see in_fill.py) instead "
-             "of a local Gaussian blur. Applies to BOTH passes. Default: off.",
-    )
-    # --- Highlight soften (blue paint; local blur + optional diffuse mix)
-    parser.add_argument(
-        "--highlight-mask",
+        "--out-masks-dir",
         default=None,
-        help="Blue-painted UV highlight mask. Enables a second pass that softens "
-             "bright pixels inside the paint via local blur and/or diffuse mix.",
-    )
-    parser.add_argument(
-        "--hl-threshold",
-        type=float,
-        default=180.0,
-        help="Min luminance (0-255) inside the highlight paint before soften. Default: 180.",
-    )
-    parser.add_argument(
-        "--hl-radius",
-        type=float,
-        default=6.0,
-        help="Highlight blur radius: Gaussian sigma (px) for mask feather + image blur. Default: 6.",
-    )
-    parser.add_argument(
-        "--hl-strength",
-        type=float,
-        default=0.7,
-        help="How strongly to apply the highlight correction (0-1). Default: 0.7.",
-    )
-    parser.add_argument(
-        "--hl-diffuse-mix",
-        type=float,
-        default=0.0,
-        help="Fraction of highlight correction target taken from diffuse "
-             "(0=local blur only, 0.5=50%% diffuse, 1=100%% diffuse). Default: 0.",
-    )
-    parser.add_argument(
-        "--hl-blur-outside-mask",
-        action="store_true",
-        help="Highlight-only override: spill --hl-radius soft edge outside the "
-             "blue paint even if --blur-outside-mask is not set.",
-    )
-    parser.add_argument(
-        "--out-hl-mask",
-        default=None,
-        help="Optional path to write the highlight blur weight mask (debug).",
-    )
-    parser.add_argument(
-        "--composite-mask",
-        default=None,
-        help="Grayscale skin composite UV mask. Full-white interior blends toward "
-             "diffuse; feathered border band gets local blur only.",
-    )
-    parser.add_argument(
-        "--composite-interior-min",
-        type=float,
-        default=250.0,
-        help="Min composite luminance (0-255) treated as full interior (diffuse). Default: 250.",
-    )
-    parser.add_argument(
-        "--composite-interior-strength",
-        type=float,
-        default=0.85,
-        help="Diffuse blend strength inside full-white composite (0-1). Default: 0.85.",
-    )
-    parser.add_argument(
-        "--composite-border-strength",
-        type=float,
-        default=0.85,
-        help="Local blur strength on composite border/feather band (0-1). Default: 0.85.",
-    )
-    parser.add_argument(
-        "--composite-radius",
-        type=float,
-        default=8.0,
-        help="Gaussian sigma (px) for composite border blur. Default: 8.",
-    )
-    parser.add_argument(
-        "--feature-preserve-mask",
-        default=None,
-        help="Grayscale mask: bright areas (eyes/mouth/etc.) are preserved from diffuse matte.",
-    )
-    parser.add_argument(
-        "--chin-mask",
-        default=None,
-        help="Grayscale mask (e.g. head_extrapolation_mask_chin_area.png) extending the "
-             "composite pass's border band into an extra region for local-blur-only seam "
-             "softening, even where the composite mask's own gradient has fallen to zero.",
-    )
-    parser.add_argument(
-        "--exclude-highlights-from-diffuse",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Exclude blue highlight paint from composite diffuse coverage (default: on).",
-    )
-    parser.add_argument(
-        "--out-composite-border",
-        default=None,
-        help="Optional path to write the composite border blur weight mask (debug).",
-    )
-    parser.add_argument(
-        "--out-composite-diffuse",
-        default=None,
-        help="Optional path to write the composite diffuse coverage mask (debug).",
-    )
-    parser.add_argument("--out-mask", required=True, help="Output grayscale concept blend mask path.")
-    parser.add_argument(
-        "--out-texture",
-        default=None,
-        help="Optional corrected albedo path. If omitted, only the mask is written.",
+        help="Optional directory to write each enabled channel's soft mask (debug).",
     )
     parser.add_argument(
         "--palette-json",
         default=None,
-        help="Optional JSON overriding DEFAULT_REGION_PALETTE "
+        help="Optional JSON overriding DEFAULT_REGION_PALETTE for color_id channels "
              '(e.g. {"forehead": [200,16,120], ...}).',
     )
     args = parser.parse_args(argv)
@@ -1077,40 +689,18 @@ def main(argv: Optional[List[str]] = None) -> None:
             raw = json.load(f)
         region_palette = {k: tuple(v) for k, v in raw.items()}
 
+    channels = _channels_from_json(args.channels_config)
+
     process(
         texture_path=args.texture,
-        diffuse_path=args.diffuse,
-        out_mask_path=args.out_mask,
+        channels=channels,
         out_texture_path=args.out_texture,
-        region_mask_path=args.region_mask,
+        diffuse_path=args.diffuse,
         diffuse_mode=args.diffuse_mode,
-        threshold=args.threshold,
-        radius=args.radius,
-        strength=args.strength,
-        region_tolerance=args.region_tolerance,
-        regions=args.regions,
         region_palette=region_palette,
         luminance_only=not args.full_rgb,
-        blur_outside_mask=args.blur_outside_mask,
-        use_infill=args.use_infill,
-        concept_diffuse_mix=args.concept_diffuse_mix,
-        highlight_mask_path=args.highlight_mask,
-        hl_threshold=args.hl_threshold,
-        hl_radius=args.hl_radius,
-        hl_strength=args.hl_strength,
-        hl_diffuse_mix=args.hl_diffuse_mix,
-        hl_blur_outside_mask=args.hl_blur_outside_mask,
-        out_hl_mask_path=args.out_hl_mask,
-        composite_mask_path=args.composite_mask,
-        composite_interior_min=args.composite_interior_min,
-        composite_interior_strength=args.composite_interior_strength,
-        composite_border_strength=args.composite_border_strength,
-        composite_radius=args.composite_radius,
         feature_preserve_path=args.feature_preserve_mask,
-        chin_mask_path=args.chin_mask,
-        exclude_highlights_from_diffuse=args.exclude_highlights_from_diffuse,
-        out_composite_border_path=args.out_composite_border,
-        out_composite_diffuse_path=args.out_composite_diffuse,
+        out_masks_dir=args.out_masks_dir,
     )
 
 

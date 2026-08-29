@@ -1,4 +1,4 @@
-"""Simple PyQt6 UI for per-pass matte / highlight blend controls.
+"""Simple PyQt6 UI for per-mask-channel luminance blend controls.
 
 Run::
 
@@ -7,10 +7,11 @@ Run::
 
 from __future__ import annotations
 
+import glob
 import os
 import sys
 import traceback
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
@@ -41,22 +42,19 @@ from PyQt6.QtWidgets import (
 
 from matte_luminance_blend import (
     DEFAULT_REGION_PALETTE,
-    apply_blending_radius,
-    apply_composite_pass,
-    blur_highlights,
-    build_region_gate,
-    composite_skin_envelope,
+    GATE_MODES,
+    MaskChannel,
+    apply_mask_channel,
+    compute_channel_gate,
     composite_weights,
-    extract_blue_paint_mask,
-    highlight_luminance_mask,
     load_rgb,
-    luminance,
-    luminance_delta_mask,
     make_diffuse_target,
     resize_to,
     sample_self_reference_skin_rgb,
     save_rgb,
 )
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
 
 # ---------------------------------------------------------------------------
@@ -271,120 +269,124 @@ class ImageViewer(QWidget):
         super().wheelEvent(event)
 
 
-def _compute(
-    sample: np.ndarray,
-    diffuse_target: np.ndarray,
-    id_map: Optional[np.ndarray],
-    hl_paint: Optional[np.ndarray],
-    composite: Optional[np.ndarray],
-    feature_preserve: Optional[np.ndarray],
-    chin_mask: Optional[np.ndarray],
-    regions: Optional[list],
-    region_tolerance: int,
-    threshold: float,
-    radius: float,
-    strength: float,
-    concept_diffuse_mix: float,
-    hl_threshold: float,
-    hl_radius: float,
-    hl_strength: float,
-    hl_diffuse_mix: float,
-    composite_interior_min: float,
-    composite_interior_strength: float,
-    composite_border_strength: float,
-    composite_radius: float,
-    exclude_highlights_from_diffuse: bool,
-    luminance_only: bool,
-    blur_outside_mask: bool,
-    hl_blur_outside_mask: bool,
-    use_infill: bool,
-    enable_concept: bool,
-    enable_composite: bool,
-    enable_highlight: bool,
-) -> Dict[str, np.ndarray]:
-    """Run concept + composite + highlight passes on in-memory images."""
-    gate = build_region_gate(id_map, DEFAULT_REGION_PALETTE, region_tolerance, regions)
-    if isinstance(gate, np.ndarray) and gate.shape == ():
-        gate = np.ones(sample.shape[:2], dtype=np.float32)
-    elif id_map is None:
-        gate = np.ones(sample.shape[:2], dtype=np.float32)
-
-    spill = bool(blur_outside_mask)
-    working = sample.copy()
-    soft = np.zeros(sample.shape[:2], dtype=np.float32)
-    hl_soft = np.zeros(sample.shape[:2], dtype=np.float32)
-    composite_border = np.zeros(sample.shape[:2], dtype=np.float32)
-    composite_diffuse = np.zeros(sample.shape[:2], dtype=np.float32)
-
-    hl_gate = extract_blue_paint_mask(hl_paint) if hl_paint is not None else None
-
-    if enable_concept:
-        raw = luminance_delta_mask(sample, diffuse_target, threshold, gate)
-        soft = apply_blending_radius(raw, radius)
-        if not spill:
-            soft = soft * gate
-        else:
-            soft = soft * (luminance(sample) >= 8.0).astype(np.float32)
-        working = blur_highlights(
-            sample,
-            soft,
-            radius,
-            strength,
-            diffuse_target=diffuse_target if concept_diffuse_mix > 0.0 else None,
-            diffuse_mix=concept_diffuse_mix,
-            luminance_only=luminance_only,
-            use_infill=use_infill,
-        )
-
-    if enable_composite and composite is not None:
-        interior_min = float(np.clip(composite_interior_min, 0.0, 255.0)) / 255.0
-        hl_for_diffuse = hl_gate if exclude_highlights_from_diffuse else None
-        working, composite_diffuse, composite_border = apply_composite_pass(
-            working,
-            diffuse_target,
-            composite,
-            composite_radius,
-            composite_interior_strength,
-            composite_border_strength,
-            interior_min=interior_min,
-            luminance_only=luminance_only,
-            feature_preserve=feature_preserve,
-            highlight_preserve=hl_for_diffuse,
-            chin_mask=chin_mask,
-        )
-
-    if enable_highlight and hl_paint is not None:
-        hl_raw = highlight_luminance_mask(working, hl_gate, hl_threshold)
-        hl_soft = apply_blending_radius(hl_raw, hl_radius)
-        hl_spill = spill or bool(hl_blur_outside_mask)
-        if not hl_spill:
-            hl_soft = hl_soft * hl_gate
-        else:
-            hl_soft = hl_soft * (luminance(working) >= 8.0).astype(np.float32)
-        working = blur_highlights(
-            working,
-            hl_soft,
-            hl_radius,
-            hl_strength,
-            diffuse_target=diffuse_target if hl_diffuse_mix > 0.0 else None,
-            diffuse_mix=hl_diffuse_mix,
-            luminance_only=luminance_only,
-            use_infill=use_infill,
-        )
-
-    return {
-        "texture": working,
-        "concept_mask": np.clip(soft * 255.0, 0, 255).astype(np.uint8),
-        "hl_mask": np.clip(hl_soft * 255.0, 0, 255).astype(np.uint8),
-        "composite_diffuse": np.clip(composite_diffuse * 255.0, 0, 255).astype(np.uint8),
-        "composite_border": np.clip(composite_border * 255.0, 0, 255).astype(np.uint8),
-        "sample": sample,
-    }
-
-
 # ---------------------------------------------------------------------------
-# Background worker (keeps UI responsive)
+# One control panel per mask channel
 # ---------------------------------------------------------------------------
+class ChannelPanel(QGroupBox):
+    """Editable controls for one MaskChannel: active toggle + its own params."""
+
+    changed = pyqtSignal()
+    removeRequested = pyqtSignal(object)
+
+    def __init__(self, name: str, mask_path: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(name, parent)
+        self.setCheckable(True)
+        self.setChecked(False)
+
+        form = QFormLayout(self)
+
+        mask_row = QWidget()
+        mrl = QHBoxLayout(mask_row)
+        mrl.setContentsMargins(0, 0, 0, 0)
+        self.mask_edit = QLineEdit(mask_path)
+        browse_btn = QPushButton("…")
+        browse_btn.setFixedWidth(28)
+        browse_btn.clicked.connect(self._browse)
+        mrl.addWidget(self.mask_edit)
+        mrl.addWidget(browse_btn)
+        form.addRow("Mask file", mask_row)
+
+        self.gate_mode = QComboBox()
+        self.gate_mode.addItems(list(GATE_MODES))
+        default_mode = "blue_paint" if "highlight" in name.lower() else "weight"
+        self.gate_mode.setCurrentText(default_mode)
+        form.addRow("Gate mode", self.gate_mode)
+
+        self.fill_holes = QCheckBox("Fill enclosed holes (envelope)")
+        form.addRow(self.fill_holes)
+
+        self.region_row = QWidget()
+        rrl = QHBoxLayout(self.region_row)
+        rrl.setContentsMargins(0, 0, 0, 0)
+        self.region_checks: Dict[str, QCheckBox] = {}
+        for rname in DEFAULT_REGION_PALETTE:
+            cb = QCheckBox(rname)
+            cb.setChecked(True)
+            self.region_checks[rname] = cb
+            rrl.addWidget(cb)
+        form.addRow("Regions", self.region_row)
+        self.region_tolerance = _SliderSpin(0.0, 120.0, 40.0, step=1.0, decimals=0, slider_scale=1)
+        form.addRow("Region tolerance", self.region_tolerance)
+
+        self.threshold = _SliderSpin(0.0, 80.0, 12.0, step=0.5, decimals=1, slider_scale=10)
+        self.radius = _SliderSpin(0.0, 64.0, 8.0, step=0.5, decimals=1, slider_scale=10)
+        self.strength = _SliderSpin(0.0, 1.0, 0.85, step=0.01, decimals=2, slider_scale=100)
+        self.diffuse_mix = _SliderSpin(0.0, 1.0, 0.0, step=0.01, decimals=2, slider_scale=100)
+        form.addRow("Threshold (dL)", self.threshold)
+        form.addRow("Blur radius (px)", self.radius)
+        form.addRow("Diffuse strength", self.strength)
+        form.addRow("Diffuse mix", self.diffuse_mix)
+
+        self.use_infill = QCheckBox("Use in_fill (core algorithm)")
+        self.use_infill.setChecked(True)
+        self.spill_outside = QCheckBox("Allow blur to spill outside mask")
+        form.addRow(self.use_infill)
+        form.addRow(self.spill_outside)
+
+        remove_btn = QPushButton("Remove channel")
+        remove_btn.clicked.connect(lambda: self.removeRequested.emit(self))
+        form.addRow(remove_btn)
+
+        self.gate_mode.currentTextChanged.connect(self._on_gate_mode_changed)
+        for w in (self.threshold, self.radius, self.strength, self.diffuse_mix, self.region_tolerance):
+            w.valueChanged.connect(lambda *_: self.changed.emit())
+        for cb in (self.use_infill, self.spill_outside, self.fill_holes, *self.region_checks.values()):
+            cb.toggled.connect(lambda *_: self.changed.emit())
+        self.mask_edit.editingFinished.connect(self.changed.emit)
+        self.toggled.connect(lambda *_: self.changed.emit())
+
+        self._on_gate_mode_changed(self.gate_mode.currentText())
+
+    def _on_gate_mode_changed(self, mode: str) -> None:
+        self.fill_holes.setVisible(mode == "weight")
+        self.region_row.setVisible(mode == "color_id")
+        self.region_tolerance.setVisible(mode == "color_id")
+        self.changed.emit()
+
+    def _browse(self) -> None:
+        start = self.mask_edit.text().strip() or "."
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open mask", start, "Images (*.png *.jpg *.jpeg *.tif *.bmp);;All (*.*)"
+        )
+        if path:
+            self.mask_edit.setText(path)
+            self.changed.emit()
+
+    def mask_path(self) -> str:
+        return self.mask_edit.text().strip()
+
+    def to_channel(self) -> MaskChannel:
+        mode = self.gate_mode.currentText()
+        regions = None
+        if mode == "color_id":
+            regions = [n for n, cb in self.region_checks.items() if cb.isChecked()] or None
+        return MaskChannel(
+            name=self.title(),
+            mask_path=self.mask_path(),
+            enabled=self.isChecked(),
+            gate_mode=mode,
+            threshold=self.threshold.value(),
+            radius=self.radius.value(),
+            strength=self.strength.value(),
+            diffuse_mix=self.diffuse_mix.value(),
+            use_infill=self.use_infill.isChecked(),
+            spill_outside=self.spill_outside.isChecked(),
+            fill_holes=self.fill_holes.isChecked(),
+            regions=regions,
+            region_tolerance=int(self.region_tolerance.value()),
+        )
+
+
 class ProcessWorker(QThread):
     finished_ok = pyqtSignal(int, dict)  # job_id, result
     failed = pyqtSignal(int, str)
@@ -392,79 +394,76 @@ class ProcessWorker(QThread):
     def __init__(
         self,
         job_id: int,
-        assets: Dict[str, Any],
         params: dict,
         write_outputs: bool = False,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.job_id = job_id
-        self.assets = assets
         self.params = params
         self.write_outputs = write_outputs
 
     def run(self) -> None:
         try:
-            result = _compute(
-                sample=self.assets["sample"],
-                diffuse_target=self.assets["diffuse_target"],
-                id_map=self.assets.get("id_map"),
-                hl_paint=self.assets.get("hl_paint"),
-                composite=self.assets.get("composite"),
-                feature_preserve=self.assets.get("feature_preserve"),
-                chin_mask=self.assets.get("chin_mask"),
-                regions=self.params["regions"],
-                region_tolerance=self.params["region_tolerance"],
-                threshold=self.params["threshold"],
-                radius=self.params["radius"],
-                strength=self.params["strength"],
-                concept_diffuse_mix=self.params["concept_diffuse_mix"],
-                hl_threshold=self.params["hl_threshold"],
-                hl_radius=self.params["hl_radius"],
-                hl_strength=self.params["hl_strength"],
-                hl_diffuse_mix=self.params["hl_diffuse_mix"],
-                composite_interior_min=self.params["composite_interior_min"],
-                composite_interior_strength=self.params["composite_interior_strength"],
-                composite_border_strength=self.params["composite_border_strength"],
-                composite_radius=self.params["composite_radius"],
-                exclude_highlights_from_diffuse=self.params["exclude_highlights_from_diffuse"],
-                luminance_only=self.params["luminance_only"],
-                blur_outside_mask=self.params["blur_outside_mask"],
-                hl_blur_outside_mask=self.params["hl_blur_outside_mask"],
-                use_infill=self.params["use_infill"],
-                enable_concept=self.params["enable_concept"],
-                enable_composite=self.params["enable_composite"],
-                enable_highlight=self.params["enable_highlight"],
-            )
+            p = self.params
+            sample: np.ndarray = p["sample"]
+            channels: List[MaskChannel] = p["channels"]
+            active = [ch for ch in channels if ch.enabled]
+
+            mask_imgs: Dict[str, np.ndarray] = {}
+            for ch in active:
+                nearest = ch.gate_mode in ("blue_paint", "color_id")
+                mask_imgs[ch.name] = resize_to(load_rgb(ch.mask_path), sample.shape[:2], nearest=nearest)
+
+            feature_preserve = None
+            if p["feature_preserve_path"]:
+                feature_preserve = composite_weights(
+                    resize_to(load_rgb(p["feature_preserve_path"]), sample.shape[:2], nearest=False)
+                )
+
+            palette = DEFAULT_REGION_PALETTE
+            if p["diffuse_mode"] == "self":
+                exclude = np.zeros(sample.shape[:2], dtype=np.float32)
+                for ch in active:
+                    exclude = np.maximum(exclude, compute_channel_gate(mask_imgs[ch.name], ch, palette))
+                if feature_preserve is not None:
+                    exclude = np.maximum(exclude, feature_preserve)
+                skin_rgb = sample_self_reference_skin_rgb(sample, exclude)
+                diffuse_target = np.empty(sample.shape, dtype=np.float32)
+                diffuse_target[...] = skin_rgb
+            else:
+                diffuse_img = load_rgb(p["diffuse_path"])
+                diffuse_target = make_diffuse_target(sample, diffuse_img, p["diffuse_mode"])
+
+            working = sample.copy()
+            channel_masks: Dict[str, np.ndarray] = {}
+            for ch in active:
+                working, soft = apply_mask_channel(
+                    working, diffuse_target, mask_imgs[ch.name], ch, palette,
+                    p["luminance_only"], feature_preserve,
+                )
+                channel_masks[ch.name] = np.clip(soft * 255.0, 0, 255).astype(np.uint8)
+
+            result: Dict[str, Any] = {
+                "texture": working,
+                "sample": sample,
+                "channel_masks": channel_masks,
+            }
+
             if self.write_outputs:
-                out_mask = self.params["out_mask_path"]
-                out_hl = self.params["out_hl_mask_path"]
-                out_comp = self.params["out_composite_border_path"]
-                out_diff = self.params["out_composite_diffuse_path"]
-                out_tex = self.params["out_texture_path"]
-                os.makedirs(os.path.dirname(out_mask) or ".", exist_ok=True)
+                out_tex = p["out_texture_path"]
+                out_dir = p["out_masks_dir"]
                 os.makedirs(os.path.dirname(out_tex) or ".", exist_ok=True)
-                if out_hl:
-                    os.makedirs(os.path.dirname(out_hl) or ".", exist_ok=True)
-                if out_comp:
-                    os.makedirs(os.path.dirname(out_comp) or ".", exist_ok=True)
-                if out_diff:
-                    os.makedirs(os.path.dirname(out_diff) or ".", exist_ok=True)
-                save_rgb(out_mask, result["concept_mask"])
-                if out_hl:
-                    save_rgb(out_hl, result["hl_mask"])
-                if out_comp:
-                    save_rgb(out_comp, result["composite_border"])
-                if out_diff:
-                    save_rgb(out_diff, result["composite_diffuse"])
-                save_rgb(out_tex, result["texture"])
-                result["paths"] = {
-                    "mask": out_mask,
-                    "hl_mask": out_hl,
-                    "composite_border": out_comp,
-                    "composite_diffuse": out_diff,
-                    "texture": out_tex,
-                }
+                save_rgb(out_tex, working)
+                paths = {"texture": out_tex}
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+                    for name, mask_u8 in channel_masks.items():
+                        mp = os.path.join(out_dir, f"{name}_mask.png")
+                        save_rgb(mp, mask_u8)
+                        paths[f"mask:{name}"] = mp
+                result["paths"] = paths
+
             self.finished_ok.emit(self.job_id, result)
         except Exception:
             self.failed.emit(self.job_id, traceback.format_exc())
@@ -477,13 +476,13 @@ class MatteBlendWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Matte Luminance Blend")
-        self.resize(1400, 900)
+        self.resize(1450, 950)
         self._worker: Optional[ProcessWorker] = None
         self._job_id = 0
         self._pending_run: Optional[Tuple[dict, bool]] = None
-        self._assets: Optional[Dict[str, Any]] = None
-        self._assets_key: Optional[tuple] = None
+        self._sample_cache: Optional[Tuple[str, np.ndarray]] = None
         self._root = os.path.dirname(os.path.abspath(__file__))
+        self._channel_panels: List[ChannelPanel] = []
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -500,20 +499,20 @@ class MatteBlendWindow(QMainWindow):
 
         # --- Scrollable controls column -------------------------------------
         controls_host = QWidget()
-        controls_host.setMinimumWidth(360)
-        controls_host.setMaximumWidth(460)
-        ch = QVBoxLayout(controls_host)
-        ch.setContentsMargins(0, 0, 0, 0)
+        controls_host.setMinimumWidth(380)
+        controls_host.setMaximumWidth(480)
+        ch_layout = QVBoxLayout(controls_host)
+        ch_layout.setContentsMargins(0, 0, 0, 0)
 
         controls_scroll = QScrollArea()
         controls_scroll.setWidgetResizable(True)
         controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
         controls_inner = QWidget()
-        cl = QVBoxLayout(controls_inner)
-        cl.setContentsMargins(4, 4, 8, 4)
+        self._controls_layout = QVBoxLayout(controls_inner)
+        self._controls_layout.setContentsMargins(4, 4, 8, 4)
         controls_scroll.setWidget(controls_inner)
-        ch.addWidget(controls_scroll)
+        ch_layout.addWidget(controls_scroll)
         splitter.addWidget(controls_host)
 
         # --- Inputs ---------------------------------------------------------
@@ -521,111 +520,32 @@ class MatteBlendWindow(QMainWindow):
         io = QFormLayout(io_box)
         self.texture_edit = self._path_row(io, "Texture (albedo)", "", invalidate=True)
         self.diffuse_edit = self._path_row(io, "Diffuse", "", invalidate=True)
-        self.region_edit = self._path_row(io, "Region / concept mask", "", invalidate=True)
-        self.highlight_edit = self._path_row(io, "Highlight paint mask", "", invalidate=True)
-        self.composite_edit = self._path_row(io, "Composite skin mask", "", invalidate=True)
         self.feature_edit = self._path_row(io, "Feature preserve mask", "", invalidate=True)
 
         self.diffuse_mode = QComboBox()
-        self.diffuse_mode.addItems(["uv", "palette", "self"])
+        self.diffuse_mode.addItems(["self", "uv", "palette"])
         self.diffuse_mode.currentIndexChanged.connect(self._on_inputs_changed)
         io.addRow("Diffuse mode", self.diffuse_mode)
+        self._controls_layout.addWidget(io_box)
 
-        self.chk_concept = QCheckBox("Enable concept (luminance-delta) pass")
-        self.chk_concept.setChecked(True)
-        self.chk_composite = QCheckBox("Enable composite pass (face=diffuse, edge=blur)")
-        self.chk_composite.setChecked(True)
-        self.chk_highlight = QCheckBox("Enable highlight soften pass")
-        self.chk_highlight.setChecked(True)
-        io.addRow(self.chk_concept)
-        io.addRow(self.chk_composite)
-        io.addRow(self.chk_highlight)
-        cl.addWidget(io_box)
+        # --- Mask channels ----------------------------------------------------
+        self.channels_box = QGroupBox("Mask channels")
+        self.channels_layout = QVBoxLayout(self.channels_box)
+        add_btn = QPushButton("Add mask…")
+        add_btn.clicked.connect(self._add_channel_dialog)
+        self.channels_layout.addWidget(add_btn)
+        self._controls_layout.addWidget(self.channels_box)
 
-        # --- Composite pass -------------------------------------------------
-        composite_box = QGroupBox("Composite pass  (full face diffuse, preserve features)")
-        compf = QFormLayout(composite_box)
-        self.composite_interior_min = _SliderSpin(
-            200.0, 255.0, 250.0, step=1.0, decimals=0, slider_scale=1
-        )
-        self.composite_interior_strength = _SliderSpin(
-            0.0, 1.0, 0.85, step=0.01, decimals=2, slider_scale=100
-        )
-        self.composite_border_strength = _SliderSpin(
-            0.0, 1.0, 0.85, step=0.01, decimals=2, slider_scale=100
-        )
-        self.composite_radius = _SliderSpin(0.0, 64.0, 8.0, step=0.5, decimals=1, slider_scale=10)
-        self.chk_exclude_hl_diffuse = QCheckBox("Exclude highlight paint from diffuse coverage")
-        self.chk_exclude_hl_diffuse.setChecked(True)
-        compf.addRow("Border detect min (L≥)", self.composite_interior_min)
-        compf.addRow("Diffuse strength", self.composite_interior_strength)
-        compf.addRow("Border blur strength", self.composite_border_strength)
-        compf.addRow("Border blur radius (px)", self.composite_radius)
-        compf.addRow(self.chk_exclude_hl_diffuse)
-        cl.addWidget(composite_box)
-
-        # --- Chin extrapolation mask (extends composite border band) --------
-        chin_box = QGroupBox("Chin mask  (extends composite border band)")
-        chinf = QFormLayout(chin_box)
-        self.chin_edit = self._path_row(chinf, "Chin extrapolation mask", "", invalidate=True)
-        cl.addWidget(chin_box)
-
-        # --- Concept pass ---------------------------------------------------
-        concept_box = QGroupBox("Concept pass  (region-gated luminance-delta correction)")
-        cf = QFormLayout(concept_box)
-        self.concept_threshold = _SliderSpin(0.0, 80.0, 12.0, step=0.5, decimals=1, slider_scale=10)
-        self.concept_radius = _SliderSpin(0.0, 64.0, 8.0, step=0.5, decimals=1, slider_scale=10)
-        self.concept_strength = _SliderSpin(0.0, 1.0, 0.85, step=0.01, decimals=2, slider_scale=100)
-        self.concept_diffuse_mix = _SliderSpin(0.0, 1.0, 0.0, step=0.01, decimals=2, slider_scale=100)
-        cf.addRow("Threshold (dL)", self.concept_threshold)
-        cf.addRow("Blur / radius (px)", self.concept_radius)
-        cf.addRow("Intensity / strength", self.concept_strength)
-        cf.addRow("Diffuse mix (0=blur only)", self.concept_diffuse_mix)
-        cl.addWidget(concept_box)
-
-        # --- Highlight pass -------------------------------------------------
-        hl_box = QGroupBox("Highlight pass  (blue paint)")
-        hf = QFormLayout(hl_box)
-        self.hl_threshold = _SliderSpin(0.0, 255.0, 180.0, step=1.0, decimals=1, slider_scale=10)
-        self.hl_radius = _SliderSpin(0.0, 64.0, 6.0, step=0.5, decimals=1, slider_scale=10)
-        self.hl_strength = _SliderSpin(0.0, 1.0, 0.70, step=0.01, decimals=2, slider_scale=100)
-        self.hl_diffuse_mix = _SliderSpin(0.0, 1.0, 0.0, step=0.01, decimals=2, slider_scale=100)
-        hf.addRow("Threshold (L)", self.hl_threshold)
-        hf.addRow("Blur / radius (px)", self.hl_radius)
-        hf.addRow("Intensity / strength", self.hl_strength)
-        hf.addRow("Diffuse mix (0=blur only)", self.hl_diffuse_mix)
-        cl.addWidget(hl_box)
-
-        # --- Shared / regions -----------------------------------------------
+        # --- Shared options ---------------------------------------------------
         shared_box = QGroupBox("Shared options")
         sf = QFormLayout(shared_box)
-        self.chk_live = QCheckBox("Live preview (update on slider change)")
+        self.chk_live = QCheckBox("Live preview (update on change)")
         self.chk_live.setChecked(True)
         self.chk_luma_only = QCheckBox("Luminance-only blend (keep chroma)")
         self.chk_luma_only.setChecked(True)
-        self.chk_spill = QCheckBox("Blur outside painted mask (both passes)")
-        self.chk_hl_spill = QCheckBox("Highlight: spill outside blue paint")
-        self.chk_use_infill = QCheckBox(
-            "Use infill (push surrounding colors) instead of local blur (both passes)"
-        )
         sf.addRow(self.chk_live)
         sf.addRow(self.chk_luma_only)
-        sf.addRow(self.chk_spill)
-        sf.addRow(self.chk_hl_spill)
-        sf.addRow(self.chk_use_infill)
-
-        region_row = QHBoxLayout()
-        self.region_checks = {}
-        for name in DEFAULT_REGION_PALETTE:
-            cb = QCheckBox(name)
-            cb.setChecked(True)
-            self.region_checks[name] = cb
-            region_row.addWidget(cb)
-        sf.addRow("Regions", region_row)
-
-        self.region_tol = _SliderSpin(0.0, 120.0, 40.0, step=1.0, decimals=0, slider_scale=1)
-        sf.addRow("Region color tolerance", self.region_tol)
-        cl.addWidget(shared_box)
+        self._controls_layout.addWidget(shared_box)
 
         # --- Outputs --------------------------------------------------------
         out_box = QGroupBox("Outputs")
@@ -634,29 +554,20 @@ class MatteBlendWindow(QMainWindow):
         self.out_texture = self._path_row(
             of, "Corrected texture", os.path.join(out_dir, "albedo_matte.png"), save=True
         )
-        self.out_mask = self._path_row(
-            of, "Concept mask", os.path.join(out_dir, "blend_mask.png"), save=True
+        self.out_masks_dir = self._path_row(
+            of, "Channel masks dir (debug)", os.path.join(out_dir, "channel_masks"), save=True, is_dir=True
         )
-        self.out_hl_mask = self._path_row(
-            of, "Highlight mask", os.path.join(out_dir, "hl_blend_mask.png"), save=True
-        )
-        self.out_composite_border = self._path_row(
-            of, "Composite border mask", os.path.join(out_dir, "composite_border_mask.png"), save=True
-        )
-        self.out_composite_diffuse = self._path_row(
-            of, "Composite diffuse mask", os.path.join(out_dir, "composite_diffuse_mask.png"), save=True
-        )
-        cl.addWidget(out_box)
+        self._controls_layout.addWidget(out_box)
 
         self.run_btn = QPushButton("Process & Save")
         self.run_btn.setMinimumHeight(36)
         self.run_btn.clicked.connect(self._on_process)
-        cl.addWidget(self.run_btn)
+        self._controls_layout.addWidget(self.run_btn)
 
-        self.status = QLabel("Ready — adjust sliders for live preview, or Process & Save.")
+        self.status = QLabel("Ready — check a mask active for live preview, or Process & Save.")
         self.status.setWordWrap(True)
-        cl.addWidget(self.status)
-        cl.addStretch(1)
+        self._controls_layout.addWidget(self.status)
+        self._controls_layout.addStretch(1)
 
         # --- Preview --------------------------------------------------------
         preview_wrap = QWidget()
@@ -664,14 +575,7 @@ class MatteBlendWindow(QMainWindow):
         pl.setContentsMargins(0, 0, 0, 0)
         self.tabs = QTabWidget()
         self.viewers: Dict[str, ImageViewer] = {}
-        for key, title in (
-            ("result", "Result"),
-            ("sample", "Original"),
-            ("concept_mask", "Concept mask"),
-            ("composite_diffuse", "Composite diffuse"),
-            ("composite_border", "Composite border"),
-            ("hl_mask", "Highlight mask"),
-        ):
+        for key, title in (("result", "Result"), ("sample", "Original")):
             viewer = ImageViewer()
             self.tabs.addTab(viewer, title)
             self.viewers[key] = viewer
@@ -683,58 +587,55 @@ class MatteBlendWindow(QMainWindow):
         splitter.addWidget(preview_wrap)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([420, 980])
+        splitter.setSizes([440, 1010])
 
         self._seed_default_paths()
-        self._connect_live_controls()
+        self._discover_channels()
+
+    # -- channel discovery / management --------------------------------------
+    def _discover_channels(self) -> None:
+        masks_dir = os.path.join(self._root, "masks")
+        if not os.path.isdir(masks_dir):
+            return
+        found: List[str] = []
+        for ext in IMAGE_EXTS:
+            found.extend(glob.glob(os.path.join(masks_dir, f"*{ext}")))
+        for path in sorted(found):
+            name = os.path.splitext(os.path.basename(path))[0]
+            self._add_channel_panel(name, path)
+
+    def _add_channel_dialog(self) -> None:
+        start = os.path.join(self._root, "masks")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Add mask", start, "Images (*.png *.jpg *.jpeg *.tif *.bmp);;All (*.*)"
+        )
+        if path:
+            name = os.path.splitext(os.path.basename(path))[0]
+            self._add_channel_panel(name, path)
+
+    def _add_channel_panel(self, name: str, mask_path: str) -> None:
+        panel = ChannelPanel(name, mask_path)
+        panel.changed.connect(self._schedule_live_preview)
+        panel.removeRequested.connect(self._remove_channel_panel)
+        # Insert above the "Add mask…" button, which is always the last item.
+        self.channels_layout.insertWidget(self.channels_layout.count() - 1, panel)
+        self._channel_panels.append(panel)
+
+    def _remove_channel_panel(self, panel: ChannelPanel) -> None:
+        self._channel_panels.remove(panel)
+        self.channels_layout.removeWidget(panel)
+        panel.deleteLater()
+        self._schedule_live_preview()
 
     # -- live preview wiring -------------------------------------------------
-    def _connect_live_controls(self) -> None:
-        sliders = (
-            self.concept_threshold,
-            self.concept_radius,
-            self.concept_strength,
-            self.concept_diffuse_mix,
-            self.composite_interior_min,
-            self.composite_interior_strength,
-            self.composite_border_strength,
-            self.composite_radius,
-            self.hl_threshold,
-            self.hl_radius,
-            self.hl_strength,
-            self.hl_diffuse_mix,
-            self.region_tol,
-        )
-        for w in sliders:
-            w.valueChanged.connect(self._schedule_live_preview)
-
-        for cb in (
-            self.chk_concept,
-            self.chk_composite,
-            self.chk_highlight,
-            self.chk_exclude_hl_diffuse,
-            self.chk_luma_only,
-            self.chk_spill,
-            self.chk_hl_spill,
-            *self.region_checks.values(),
-        ):
-            cb.toggled.connect(self._schedule_live_preview)
-
-        self.chk_live.toggled.connect(self._on_live_toggled)
-
-    def _on_live_toggled(self, on: bool) -> None:
-        if on:
-            self._schedule_live_preview()
+    def _on_inputs_changed(self, *_args) -> None:
+        self._sample_cache = None
+        self._schedule_live_preview()
 
     def _schedule_live_preview(self, *_args) -> None:
         if not self.chk_live.isChecked():
             return
         self._debounce.start()
-
-    def _on_inputs_changed(self, *_args) -> None:
-        self._assets = None
-        self._assets_key = None
-        self._schedule_live_preview()
 
     def _run_live_preview(self) -> None:
         if not self.chk_live.isChecked():
@@ -756,6 +657,7 @@ class MatteBlendWindow(QMainWindow):
         default: str,
         save: bool = False,
         invalidate: bool = False,
+        is_dir: bool = False,
     ) -> QLineEdit:
         row = QWidget()
         hl = QHBoxLayout(row)
@@ -763,7 +665,7 @@ class MatteBlendWindow(QMainWindow):
         edit = QLineEdit(default)
         btn = QPushButton("…")
         btn.setFixedWidth(32)
-        btn.clicked.connect(lambda: self._browse(edit, save=save, invalidate=invalidate))
+        btn.clicked.connect(lambda: self._browse(edit, save=save, invalidate=invalidate, is_dir=is_dir))
         hl.addWidget(edit)
         hl.addWidget(btn)
         form.addRow(label, row)
@@ -771,9 +673,11 @@ class MatteBlendWindow(QMainWindow):
             edit.editingFinished.connect(self._on_inputs_changed)
         return edit
 
-    def _browse(self, edit: QLineEdit, save: bool = False, invalidate: bool = False) -> None:
+    def _browse(self, edit: QLineEdit, save: bool = False, invalidate: bool = False, is_dir: bool = False) -> None:
         start = edit.text().strip() or self._root
-        if save:
+        if is_dir:
+            path = QFileDialog.getExistingDirectory(self, "Select directory", start)
+        elif save:
             path, _ = QFileDialog.getSaveFileName(
                 self, "Save image", start, "Images (*.png *.jpg *.jpeg *.tif);;All (*.*)"
             )
@@ -787,102 +691,15 @@ class MatteBlendWindow(QMainWindow):
                 self._on_inputs_changed()
 
     def _seed_default_paths(self) -> None:
-        masks = os.path.join(self._root, "masks")
-        concept = os.path.join(masks, "mask_concept_texture.png")
-        highlights = os.path.join(masks, "body_mat_mask_C_highlights_00.png")
-        composite = os.path.join(masks, "head_composite_skin_mask.png")
-        feature = os.path.join(masks, "head_extrapolation_mask.png")
-        chin = os.path.join(masks, "head_extrapolation_mask_chin_area.png")
-        if os.path.isfile(concept):
-            self.region_edit.setText(concept)
-        if os.path.isfile(highlights):
-            self.highlight_edit.setText(highlights)
-        if os.path.isfile(composite):
-            self.composite_edit.setText(composite)
-        if os.path.isfile(feature):
-            self.feature_edit.setText(feature)
-        if os.path.isfile(chin):
-            self.chin_edit.setText(chin)
+        pass
 
-    # -- assets cache --------------------------------------------------------
-    def _assets_cache_key(self, params: dict) -> tuple:
-        return (
-            params["texture_path"],
-            params["diffuse_path"],
-            params["diffuse_mode"],
-            params["region_mask_path"],
-            params["highlight_mask_path"],
-            params["composite_mask_path"],
-            params["feature_preserve_path"],
-            params["chin_mask_path"],
-        )
-
-    def _ensure_assets(self, params: dict) -> Dict[str, Any]:
-        key = self._assets_cache_key(params)
-        if self._assets is not None and self._assets_key == key:
-            return self._assets
-
-        sample = load_rgb(params["texture_path"])
-
-        id_map = None
-        if params["region_mask_path"]:
-            id_map = resize_to(
-                load_rgb(params["region_mask_path"]), sample.shape[:2], nearest=True
-            )
-
-        hl_paint = None
-        if params["highlight_mask_path"]:
-            hl_paint = resize_to(
-                load_rgb(params["highlight_mask_path"]), sample.shape[:2], nearest=True
-            )
-
-        composite = None
-        if params["composite_mask_path"]:
-            composite = resize_to(
-                load_rgb(params["composite_mask_path"]), sample.shape[:2], nearest=False
-            )
-
-        feature_preserve = None
-        if params["feature_preserve_path"]:
-            feature_preserve = resize_to(
-                load_rgb(params["feature_preserve_path"]), sample.shape[:2], nearest=False
-            )
-
-        chin_mask = None
-        if params["chin_mask_path"]:
-            chin_mask = resize_to(
-                load_rgb(params["chin_mask_path"]), sample.shape[:2], nearest=False
-            )
-
-        if params["diffuse_mode"] == "self":
-            if id_map is not None:
-                gate = build_region_gate(id_map, DEFAULT_REGION_PALETTE, params["region_tolerance"], params["regions"])
-                exclude = gate.copy()
-            else:
-                exclude = np.zeros(sample.shape[:2], dtype=np.float32)
-            if hl_paint is not None:
-                exclude = np.maximum(exclude, extract_blue_paint_mask(hl_paint))
-            if feature_preserve is not None:
-                exclude = np.maximum(exclude, composite_weights(feature_preserve))
-            envelope_ref = composite_skin_envelope(composite) if composite is not None else None
-            skin_rgb = sample_self_reference_skin_rgb(sample, exclude, envelope_ref)
-            diffuse_target = np.empty(sample.shape, dtype=np.float32)
-            diffuse_target[...] = skin_rgb
-        else:
-            diffuse_img = load_rgb(params["diffuse_path"])
-            diffuse_target = make_diffuse_target(sample, diffuse_img, params["diffuse_mode"])
-
-        self._assets = {
-            "sample": sample,
-            "diffuse_target": diffuse_target,
-            "id_map": id_map,
-            "hl_paint": hl_paint,
-            "composite": composite,
-            "feature_preserve": feature_preserve,
-            "chin_mask": chin_mask,
-        }
-        self._assets_key = key
-        return self._assets
+    # -- sample cache ---------------------------------------------------------
+    def _ensure_sample(self, texture_path: str) -> np.ndarray:
+        if self._sample_cache is not None and self._sample_cache[0] == texture_path:
+            return self._sample_cache[1]
+        sample = load_rgb(texture_path)
+        self._sample_cache = (texture_path, sample)
+        return sample
 
     # -- process -------------------------------------------------------------
     def _gather_params(self) -> dict:
@@ -894,75 +711,35 @@ class MatteBlendWindow(QMainWindow):
         if diffuse_mode != "self" and (not diffuse or not os.path.isfile(diffuse)):
             raise FileNotFoundError("Select a valid diffuse image (or switch diffuse mode to 'self').")
 
-        region = self.region_edit.text().strip() or None
-        highlight = self.highlight_edit.text().strip() or None
-        composite = self.composite_edit.text().strip() or None
         feature = self.feature_edit.text().strip() or None
-        chin = self.chin_edit.text().strip() or None
-        if region and not os.path.isfile(region):
-            raise FileNotFoundError(f"Region mask not found: {region}")
-        if self.chk_highlight.isChecked() and highlight and not os.path.isfile(highlight):
-            raise FileNotFoundError(f"Highlight mask not found: {highlight}")
-        if self.chk_composite.isChecked() and composite and not os.path.isfile(composite):
-            raise FileNotFoundError(f"Composite mask not found: {composite}")
         if feature and not os.path.isfile(feature):
             raise FileNotFoundError(f"Feature preserve mask not found: {feature}")
-        if self.chk_composite.isChecked() and chin and not os.path.isfile(chin):
-            raise FileNotFoundError(f"Chin extrapolation mask not found: {chin}")
 
-        regions = [n for n, cb in self.region_checks.items() if cb.isChecked()] or None
+        channels: List[MaskChannel] = []
+        for panel in self._channel_panels:
+            ch = panel.to_channel()
+            if ch.enabled:
+                if not ch.mask_path or not os.path.isfile(ch.mask_path):
+                    raise FileNotFoundError(f"Mask file not found for channel '{ch.name}': {ch.mask_path}")
+            channels.append(ch)
+
+        sample = self._ensure_sample(texture)
 
         return dict(
-            texture_path=texture,
+            sample=sample,
+            channels=channels,
             diffuse_path=diffuse,
             diffuse_mode=diffuse_mode,
-            region_mask_path=region,
-            highlight_mask_path=highlight if self.chk_highlight.isChecked() else None,
-            composite_mask_path=composite if self.chk_composite.isChecked() else None,
             feature_preserve_path=feature,
-            chin_mask_path=chin if self.chk_composite.isChecked() else None,
-            regions=regions,
-            region_tolerance=int(self.region_tol.value()),
-            threshold=self.concept_threshold.value(),
-            radius=self.concept_radius.value(),
-            strength=self.concept_strength.value(),
-            concept_diffuse_mix=self.concept_diffuse_mix.value(),
-            composite_interior_min=self.composite_interior_min.value(),
-            composite_interior_strength=self.composite_interior_strength.value(),
-            composite_border_strength=self.composite_border_strength.value(),
-            composite_radius=self.composite_radius.value(),
-            hl_threshold=self.hl_threshold.value(),
-            hl_radius=self.hl_radius.value(),
-            hl_strength=self.hl_strength.value(),
-            hl_diffuse_mix=self.hl_diffuse_mix.value(),
-            exclude_highlights_from_diffuse=self.chk_exclude_hl_diffuse.isChecked(),
             luminance_only=self.chk_luma_only.isChecked(),
-            blur_outside_mask=self.chk_spill.isChecked(),
-            hl_blur_outside_mask=self.chk_hl_spill.isChecked(),
-            use_infill=self.chk_use_infill.isChecked(),
-            enable_concept=self.chk_concept.isChecked(),
-            enable_composite=self.chk_composite.isChecked(),
-            enable_highlight=self.chk_highlight.isChecked(),
-            out_mask_path=self.out_mask.text().strip(),
-            out_hl_mask_path=self.out_hl_mask.text().strip(),
-            out_composite_border_path=self.out_composite_border.text().strip(),
-            out_composite_diffuse_path=self.out_composite_diffuse.text().strip(),
             out_texture_path=self.out_texture.text().strip(),
+            out_masks_dir=self.out_masks_dir.text().strip() or None,
         )
 
     def _start_job(self, params: dict, write_outputs: bool) -> None:
         if self._worker and self._worker.isRunning():
             self._pending_run = (params, write_outputs)
             self.status.setText("Updating…")
-            return
-
-        try:
-            assets = self._ensure_assets(params)
-        except Exception as exc:
-            if write_outputs:
-                QMessageBox.warning(self, "Inputs", str(exc))
-            else:
-                self.status.setText(f"Preview skipped: {exc}")
             return
 
         self._job_id += 1
@@ -973,7 +750,7 @@ class MatteBlendWindow(QMainWindow):
         else:
             self.status.setText("Updating preview…")
 
-        self._worker = ProcessWorker(job_id, assets, params, write_outputs, self)
+        self._worker = ProcessWorker(job_id, params, write_outputs, self)
         self._worker.finished_ok.connect(self._on_done)
         self._worker.failed.connect(self._on_fail)
         self._worker.start()
@@ -986,6 +763,16 @@ class MatteBlendWindow(QMainWindow):
             return
         self._start_job(params, write_outputs=True)
 
+    def _rebuild_mask_tabs(self, channel_masks: Dict[str, np.ndarray]) -> None:
+        while self.tabs.count() > 2:
+            w = self.tabs.widget(2)
+            self.tabs.removeTab(2)
+            w.deleteLater()
+        for name, mask_u8 in channel_masks.items():
+            viewer = ImageViewer()
+            viewer.set_image(mask_u8)
+            self.tabs.addTab(viewer, name)
+
     def _on_done(self, job_id: int, result: dict) -> None:
         if job_id != self._job_id:
             return
@@ -993,19 +780,15 @@ class MatteBlendWindow(QMainWindow):
         self.run_btn.setEnabled(True)
         self.viewers["result"].set_image(result["texture"])
         self.viewers["sample"].set_image(result["sample"])
-        self.viewers["concept_mask"].set_image(result["concept_mask"])
-        self.viewers["composite_diffuse"].set_image(result["composite_diffuse"])
-        self.viewers["composite_border"].set_image(result["composite_border"])
-        self.viewers["hl_mask"].set_image(result["hl_mask"])
+        self._rebuild_mask_tabs(result["channel_masks"])
 
         if "paths" in result:
             paths = result["paths"]
-            self.status.setText(
-                f"Saved.\nTexture → {paths['texture']}\n"
-                f"Concept mask → {paths['mask']}\n"
-                f"Composite border → {paths['composite_border']}\n"
-                f"Highlight mask → {paths['hl_mask']}"
-            )
+            lines = [f"Saved.\nTexture → {paths['texture']}"]
+            mask_paths = [v for k, v in paths.items() if k.startswith("mask:")]
+            if mask_paths:
+                lines.append(f"Channel masks → {os.path.dirname(mask_paths[0])}")
+            self.status.setText("\n".join(lines))
             self.tabs.setCurrentIndex(0)
         else:
             self.status.setText("Live preview updated.")
