@@ -44,12 +44,12 @@ from matte_luminance_blend import (
     DEFAULT_REGION_PALETTE,
     GATE_MODES,
     MaskChannel,
-    apply_mask_channel,
     compute_channel_gate,
     composite_weights,
     load_rgb,
     make_diffuse_target,
     resize_to,
+    run_channel_pipeline,
     sample_self_reference_skin_rgb,
     save_rgb,
 )
@@ -333,16 +333,23 @@ class ChannelPanel(QGroupBox):
         form.addRow(self.use_infill)
         form.addRow(self.spill_outside)
 
+        self.blend_group = QLineEdit()
+        self.blend_group.setPlaceholderText("optional — e.g. skin_uniform")
+        form.addRow("Blend group", self.blend_group)
+        self.blend_weight = _SliderSpin(0.0, 5.0, 1.0, step=0.05, decimals=2, slider_scale=100)
+        form.addRow("Blend weight (within group)", self.blend_weight)
+
         remove_btn = QPushButton("Remove channel")
         remove_btn.clicked.connect(lambda: self.removeRequested.emit(self))
         form.addRow(remove_btn)
 
         self.gate_mode.currentTextChanged.connect(self._on_gate_mode_changed)
-        for w in (self.threshold, self.radius, self.strength, self.diffuse_mix, self.region_tolerance):
+        for w in (self.threshold, self.radius, self.strength, self.diffuse_mix, self.region_tolerance, self.blend_weight):
             w.valueChanged.connect(lambda *_: self.changed.emit())
         for cb in (self.use_infill, self.spill_outside, self.fill_holes, *self.region_checks.values()):
             cb.toggled.connect(lambda *_: self.changed.emit())
         self.mask_edit.editingFinished.connect(self.changed.emit)
+        self.blend_group.editingFinished.connect(self.changed.emit)
         self.toggled.connect(lambda *_: self.changed.emit())
 
         self._on_gate_mode_changed(self.gate_mode.currentText())
@@ -384,6 +391,8 @@ class ChannelPanel(QGroupBox):
             fill_holes=self.fill_holes.isChecked(),
             regions=regions,
             region_tolerance=int(self.region_tolerance.value()),
+            blend_group=self.blend_group.text().strip() or None,
+            blend_weight=self.blend_weight.value(),
         )
 
 
@@ -435,14 +444,12 @@ class ProcessWorker(QThread):
                 diffuse_img = load_rgb(p["diffuse_path"])
                 diffuse_target = make_diffuse_target(sample, diffuse_img, p["diffuse_mode"])
 
-            working = sample.copy()
-            channel_masks: Dict[str, np.ndarray] = {}
-            for ch in active:
-                working, soft = apply_mask_channel(
-                    working, diffuse_target, mask_imgs[ch.name], ch, palette,
-                    p["luminance_only"], feature_preserve,
-                )
-                channel_masks[ch.name] = np.clip(soft * 255.0, 0, 255).astype(np.uint8)
+            working, soft_masks = run_channel_pipeline(
+                sample, diffuse_target, mask_imgs, active, palette, p["luminance_only"], feature_preserve,
+            )
+            channel_masks = {
+                name: np.clip(soft * 255.0, 0, 255).astype(np.uint8) for name, soft in soft_masks.items()
+            }
 
             result: Dict[str, Any] = {
                 "texture": working,

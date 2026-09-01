@@ -91,6 +91,15 @@ class MaskChannel:
             to include. None means all.
         region_tolerance: gate_mode="color_id" only — RGB tolerance when
             matching ID mask colors.
+        blend_group: Optional group name. Channels sharing the same non-empty
+            group are not applied sequentially (one on top of the other's
+            output); instead each computes its own correction independently
+            against the same input and the results are composited together,
+            weighted by each channel's own coverage — see ``apply_blend_group``.
+            Every other parameter above still applies per-channel as usual.
+        blend_weight: Relative contribution of this channel within its
+            ``blend_group`` when two channels' coverage overlaps. Ignored
+            for channels with no blend_group.
     """
 
     name: str
@@ -106,6 +115,8 @@ class MaskChannel:
     fill_holes: bool = False
     regions: Optional[Sequence[str]] = None
     region_tolerance: int = 40
+    blend_group: Optional[str] = None
+    blend_weight: float = 1.0
 
     def __post_init__(self) -> None:
         if self.gate_mode not in GATE_MODES:
@@ -424,49 +435,25 @@ def masked_gaussian_blur(
     return num / np.maximum(den, 1e-4)
 
 
-def correct_region(
+def build_correction_target(
     sample: np.ndarray,
     mask: np.ndarray,
     radius: float,
-    strength: float,
     diffuse_target: Optional[np.ndarray] = None,
     diffuse_mix: float = 0.0,
-    luminance_only: bool = True,
     use_infill: bool = True,
 ) -> np.ndarray:
-    """Softens masked pixels using local repaint and optional diffuse color mix.
+    """Builds the full-image correction color a mask channel would blend toward.
 
-    For each masked pixel, builds a correction target::
-
-        target = (1 - diffuse_mix) * local_repaint + diffuse_mix * diffuse
-
-    then blends ``sample`` toward ``target`` by ``mask * strength``. This is
-    the one shared core algorithm every mask channel runs through.
-
-    Args:
-        sample: Current albedo RGB.
-        mask: Soft channel weights in [0, 1].
-        radius: Gaussian sigma (px) for the local blur of ``sample``, or (when
-            ``use_infill`` is set) the edge-softening radius after infill.
-        strength: Overall mix amount of the correction (0-1).
-        diffuse_target: Flat diffuse RGB (same size as sample). Required if
-            ``diffuse_mix`` > 0.
-        diffuse_mix: Fraction of the correction target taken from diffuse
-            (0 = local repaint only, 1 = 100% diffuse color).
-        luminance_only: Blend Y only (keep sample chroma).
-        use_infill: Build the correction target by pushing the nearest
-            surrounding (unmasked) colors into the masked region (see
-            ``in_fill.py``) instead of Gaussian-blurring the sample in place.
-            A plain local blur only softens a bright/mismatched patch — its
-            own color stays baked into the kernel average near the center —
-            while infill actually replaces the patch with the surrounding
-            skin tone. This is the "core in_fill algorithm" shared by every
-            channel.
+    ``target = (1 - diffuse_mix) * local_repaint + diffuse_mix * diffuse``.
+    This is the "core in_fill algorithm" shared by every mask channel: pushes
+    the nearest surrounding (unmasked) colors into the masked region (see
+    ``in_fill.py``) rather than Gaussian-blurring the sample in place, since a
+    plain local blur only softens a bright/mismatched patch — its own color
+    stays baked into the kernel average near the center — while infill
+    actually replaces the patch with the surrounding skin tone.
     """
-    strength = float(np.clip(strength, 0.0, 1.0))
     diffuse_mix = float(np.clip(diffuse_mix, 0.0, 1.0))
-    w = np.clip(mask.astype(np.float32) * strength, 0.0, 1.0)
-
     sample_f = sample.astype(np.float32)
     if radius <= 0:
         repaint = sample_f
@@ -479,13 +466,34 @@ def correct_region(
         repaint = cv2.GaussianBlur(sample_f, (k, k), radius)
 
     if diffuse_mix <= 0.0 or diffuse_target is None:
-        target = repaint
-    else:
-        diff_f = diffuse_target.astype(np.float32)
-        if diff_f.shape[:2] != sample_f.shape[:2]:
-            diff_f = resize_to(diff_f, sample_f.shape[:2], nearest=False).astype(np.float32)
-        target = repaint * (1.0 - diffuse_mix) + diff_f * diffuse_mix
+        return repaint
 
+    diff_f = diffuse_target.astype(np.float32)
+    if diff_f.shape[:2] != sample_f.shape[:2]:
+        diff_f = resize_to(diff_f, sample_f.shape[:2], nearest=False).astype(np.float32)
+    return repaint * (1.0 - diffuse_mix) + diff_f * diffuse_mix
+
+
+def correct_region(
+    sample: np.ndarray,
+    mask: np.ndarray,
+    radius: float,
+    strength: float,
+    diffuse_target: Optional[np.ndarray] = None,
+    diffuse_mix: float = 0.0,
+    luminance_only: bool = True,
+    use_infill: bool = True,
+) -> np.ndarray:
+    """Blends ``sample`` toward ``build_correction_target(...)`` by ``mask * strength``.
+
+    This is the standalone (non-blend-group) application of the shared core
+    algorithm — see ``build_correction_target`` for what the target is.
+    """
+    target = build_correction_target(sample, mask, radius, diffuse_target, diffuse_mix, use_infill)
+    strength = float(np.clip(strength, 0.0, 1.0))
+    w = np.clip(mask.astype(np.float32) * strength, 0.0, 1.0)
+
+    sample_f = sample.astype(np.float32)
     if luminance_only:
         y_s, cb, cr = rgb_to_ycbcr(sample_f)
         y_t = luminance(target)
@@ -495,6 +503,28 @@ def correct_region(
         out = sample_f * (1.0 - w[..., None]) + target * w[..., None]
 
     return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def compute_channel_soft_mask(
+    working: np.ndarray,
+    diffuse_target: np.ndarray,
+    mask_img: np.ndarray,
+    channel: MaskChannel,
+    palette: Dict[str, Tuple[int, int, int]],
+    feature_preserve: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Resolves one channel's soft weight mask: gate -> threshold -> feather."""
+    gate = compute_channel_gate(mask_img, channel, palette)
+    if feature_preserve is not None:
+        gate = gate * (1.0 - np.clip(feature_preserve, 0.0, 1.0))
+
+    raw = luminance_delta_mask(working, diffuse_target, channel.threshold, gate)
+    soft = apply_blending_radius(raw, channel.radius)
+    if not channel.spill_outside:
+        soft = soft * gate
+    else:
+        soft = soft * (luminance(working) >= 8.0).astype(np.float32)
+    return soft
 
 
 def apply_mask_channel(
@@ -511,17 +541,7 @@ def apply_mask_channel(
     Returns the updated working texture and the channel's soft weight mask
     (post-feather, pre-strength — useful for debug output).
     """
-    gate = compute_channel_gate(mask_img, channel, palette)
-    if feature_preserve is not None:
-        gate = gate * (1.0 - np.clip(feature_preserve, 0.0, 1.0))
-
-    raw = luminance_delta_mask(working, diffuse_target, channel.threshold, gate)
-    soft = apply_blending_radius(raw, channel.radius)
-    if not channel.spill_outside:
-        soft = soft * gate
-    else:
-        soft = soft * (luminance(working) >= 8.0).astype(np.float32)
-
+    soft = compute_channel_soft_mask(working, diffuse_target, mask_img, channel, palette, feature_preserve)
     new_working = correct_region(
         working,
         soft,
@@ -535,9 +555,136 @@ def apply_mask_channel(
     return new_working, soft
 
 
+def composite_correction_targets(
+    sample: np.ndarray,
+    targets: Sequence[np.ndarray],
+    weights: Sequence[np.ndarray],
+    luminance_only: bool = True,
+) -> np.ndarray:
+    """Alpha-composites ``sample`` with a weighted blend of several correction targets.
+
+    ``weights[i]`` is channel i's own contribution weight at each pixel
+    (its soft mask already scaled by its strength and blend_weight). A pixel
+    touched by only one channel keeps that channel's own correction
+    unchanged; a pixel touched by several blends proportionally between
+    their targets instead of one channel overwriting another's result.
+    """
+    stack_w = np.clip(np.stack(weights, axis=0), 0.0, 1.0)
+    total_w = np.maximum(stack_w.sum(axis=0), 1e-6)
+    # Union coverage (screen-combine) so overlap never exceeds full strength.
+    combined_w = np.clip(1.0 - np.prod(1.0 - stack_w, axis=0), 0.0, 1.0)
+
+    sample_f = sample.astype(np.float32)
+    if luminance_only:
+        y_s, cb, cr = rgb_to_ycbcr(sample_f)
+        y_targets = np.stack([luminance(t) for t in targets], axis=0)
+        blended_y = (y_targets * stack_w).sum(axis=0) / total_w
+        y_out = y_s * (1.0 - combined_w) + blended_y * combined_w
+        out = ycbcr_to_rgb(y_out, cb, cr)
+    else:
+        stack_t = np.stack([t.astype(np.float32) for t in targets], axis=0)
+        blended = (stack_t * stack_w[..., None]).sum(axis=0) / total_w[..., None]
+        out = sample_f * (1.0 - combined_w[..., None]) + blended * combined_w[..., None]
+
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def apply_blend_group(
+    working: np.ndarray,
+    diffuse_target: np.ndarray,
+    mask_imgs: Dict[str, np.ndarray],
+    group_channels: Sequence[MaskChannel],
+    palette: Dict[str, Tuple[int, int, int]],
+    luminance_only: bool = True,
+    feature_preserve: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Blends several channels' independent corrections into one result.
+
+    Each channel in ``group_channels`` computes its own gate, threshold,
+    radius, diffuse_mix and use_infill exactly as it would standalone — all
+    against the same shared ``working`` input rather than chained onto each
+    other's output. The corrected results are then combined per pixel via
+    ``composite_correction_targets``, weighted by each channel's own coverage
+    (soft mask * strength * blend_weight), so individual per-channel control
+    is preserved everywhere except the overlap, which blends smoothly instead
+    of one channel hard-overwriting the other.
+    """
+    targets: List[np.ndarray] = []
+    weights: List[np.ndarray] = []
+    soft_masks: Dict[str, np.ndarray] = {}
+
+    for ch in group_channels:
+        soft = compute_channel_soft_mask(working, diffuse_target, mask_imgs[ch.name], ch, palette, feature_preserve)
+        soft_masks[ch.name] = soft
+        target = build_correction_target(
+            working,
+            soft,
+            ch.radius,
+            diffuse_target=diffuse_target if ch.diffuse_mix > 0.0 else None,
+            diffuse_mix=ch.diffuse_mix,
+            use_infill=ch.use_infill,
+        )
+        targets.append(target)
+        strength = float(np.clip(ch.strength, 0.0, 1.0))
+        weights.append(soft * strength * max(ch.blend_weight, 0.0))
+
+    new_working = composite_correction_targets(working, targets, weights, luminance_only)
+    return new_working, soft_masks
+
+
 # =============================================================================
 # TOP-LEVEL PROCESS
 # =============================================================================
+def run_channel_pipeline(
+    working: np.ndarray,
+    diffuse_target: np.ndarray,
+    mask_imgs: Dict[str, np.ndarray],
+    active_channels: Sequence[MaskChannel],
+    palette: Dict[str, Tuple[int, int, int]],
+    luminance_only: bool = True,
+    feature_preserve: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Runs every enabled channel over ``working``, in order.
+
+    Channels with no ``blend_group`` are applied sequentially, each
+    correcting the previous one's output. Channels sharing a ``blend_group``
+    name are instead run together through ``apply_blend_group`` the first
+    time any of them is reached, so their results blend by coverage instead
+    of overwriting each other. Returns the final texture and each channel's
+    soft mask (for debug output).
+    """
+    working = working.copy()
+    channel_masks: Dict[str, np.ndarray] = {}
+    seen_groups = set()
+
+    for ch in active_channels:
+        if ch.blend_group:
+            if ch.blend_group in seen_groups:
+                continue
+            seen_groups.add(ch.blend_group)
+            group_members = [c for c in active_channels if c.blend_group == ch.blend_group]
+            working, group_soft = apply_blend_group(
+                working, diffuse_target, mask_imgs, group_members, palette, luminance_only, feature_preserve,
+            )
+            channel_masks.update(group_soft)
+            logger.info(
+                "Applied blend group '%s' (%s)", ch.blend_group, ", ".join(c.name for c in group_members),
+            )
+        else:
+            working, soft = apply_mask_channel(
+                working, diffuse_target, mask_imgs[ch.name], ch, palette, luminance_only, feature_preserve,
+            )
+            channel_masks[ch.name] = soft
+            logger.info(
+                "Applied channel '%s' (gate=%s, threshold=%.1f, radius=%.1f, strength=%.2f, "
+                "diffuse_mix=%.0f%%, infill=%s, active px=%.1f%%)",
+                ch.name, ch.gate_mode, ch.threshold, ch.radius, ch.strength,
+                100.0 * ch.diffuse_mix, ch.use_infill, 100.0 * float((soft > 0.01).mean()),
+            )
+
+    return working, channel_masks
+
+
 def process(
     texture_path: str,
     channels: Sequence[MaskChannel],
@@ -586,19 +733,9 @@ def process(
         diffuse_img = load_rgb(diffuse_path)
         diffuse_target = make_diffuse_target(sample, diffuse_img, diffuse_mode)
 
-    working = sample
-    channel_masks: Dict[str, np.ndarray] = {}
-    for ch in active:
-        working, soft = apply_mask_channel(
-            working, diffuse_target, mask_imgs[ch.name], ch, palette, luminance_only, feature_preserve,
-        )
-        channel_masks[ch.name] = soft
-        logger.info(
-            "Applied channel '%s' (gate=%s, threshold=%.1f, radius=%.1f, strength=%.2f, "
-            "diffuse_mix=%.0f%%, infill=%s, active px=%.1f%%)",
-            ch.name, ch.gate_mode, ch.threshold, ch.radius, ch.strength,
-            100.0 * ch.diffuse_mix, ch.use_infill, 100.0 * float((soft > 0.01).mean()),
-        )
+    working, channel_masks = run_channel_pipeline(
+        sample, diffuse_target, mask_imgs, active, palette, luminance_only, feature_preserve,
+    )
 
     results: Dict[str, str] = {}
     if out_masks_dir:
