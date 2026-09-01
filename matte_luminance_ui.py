@@ -42,15 +42,16 @@ from PyQt6.QtWidgets import (
 
 from matte_luminance_blend import (
     DEFAULT_REGION_PALETTE,
+    DEFAULT_SELF_LOCALITY_RADIUS,
     GATE_MODES,
     MaskChannel,
+    build_local_diffuse_target,
     compute_channel_gate,
     composite_weights,
     load_rgb,
     make_diffuse_target,
     resize_to,
     run_channel_pipeline,
-    sample_self_reference_skin_rgb,
     save_rgb,
 )
 
@@ -298,8 +299,10 @@ class ChannelPanel(QGroupBox):
 
         self.gate_mode = QComboBox()
         self.gate_mode.addItems(list(GATE_MODES))
-        default_mode = "blue_paint" if "highlight" in name.lower() else "weight"
-        self.gate_mode.setCurrentText(default_mode)
+        # "weight" (plain grayscale) covers every mask observed so far, including
+        # the "highlight" ones — they're pre-authored gradients, not color-coded
+        # paint. "blue_paint"/"color_id" remain available as a manual override.
+        self.gate_mode.setCurrentText("weight")
         form.addRow("Gate mode", self.gate_mode)
 
         self.fill_holes = QCheckBox("Fill enclosed holes (envelope)")
@@ -437,9 +440,7 @@ class ProcessWorker(QThread):
                     exclude = np.maximum(exclude, compute_channel_gate(mask_imgs[ch.name], ch, palette))
                 if feature_preserve is not None:
                     exclude = np.maximum(exclude, feature_preserve)
-                skin_rgb = sample_self_reference_skin_rgb(sample, exclude)
-                diffuse_target = np.empty(sample.shape, dtype=np.float32)
-                diffuse_target[...] = skin_rgb
+                diffuse_target = build_local_diffuse_target(sample, exclude, p["self_locality_radius"])
             else:
                 diffuse_img = load_rgb(p["diffuse_path"])
                 diffuse_target = make_diffuse_target(sample, diffuse_img, p["diffuse_mode"])
@@ -533,6 +534,12 @@ class MatteBlendWindow(QMainWindow):
         self.diffuse_mode.addItems(["self", "uv", "palette"])
         self.diffuse_mode.currentIndexChanged.connect(self._on_inputs_changed)
         io.addRow("Diffuse mode", self.diffuse_mode)
+
+        self.self_locality_radius = _SliderSpin(
+            8.0, 800.0, DEFAULT_SELF_LOCALITY_RADIUS, step=2.0, decimals=0, slider_scale=1
+        )
+        io.addRow("Self-mode locality radius (px)", self.self_locality_radius)
+        self.self_locality_radius.valueChanged.connect(self._schedule_live_preview)
         self._controls_layout.addWidget(io_box)
 
         # --- Mask channels ----------------------------------------------------
@@ -737,6 +744,7 @@ class MatteBlendWindow(QMainWindow):
             channels=channels,
             diffuse_path=diffuse,
             diffuse_mode=diffuse_mode,
+            self_locality_radius=self.self_locality_radius.value(),
             feature_preserve_path=feature,
             luminance_only=self.chk_luma_only.isChecked(),
             out_texture_path=self.out_texture.text().strip(),

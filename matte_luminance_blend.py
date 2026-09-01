@@ -52,6 +52,10 @@ DEFAULT_REGION_PALETTE: Dict[str, Tuple[int, int, int]] = {
 
 GATE_MODES = ("weight", "blue_paint", "color_id")
 
+# Default blur radius (px) for reconstructing the "self" diffuse target's
+# local shading gradient — see build_local_diffuse_target().
+DEFAULT_SELF_LOCALITY_RADIUS = 250.0
+
 
 # =============================================================================
 # MASK CHANNEL CONFIG
@@ -273,8 +277,8 @@ def make_diffuse_target(
                   sampled mean skin color (keeps sample chroma via Y swap later).
 
     ``self`` mode (deriving the target from the sample itself rather than an
-    external diffuse asset) is handled by ``sample_self_reference_skin_rgb``
-    in ``process()``, since it needs the union of enabled channel gates.
+    external diffuse asset) is handled by ``build_local_diffuse_target`` in
+    ``process()``, since it needs the union of enabled channel gates.
     """
     if mode == "uv":
         return resize_to(diffuse, sample.shape[:2], nearest=False).astype(np.float32)
@@ -288,35 +292,52 @@ def make_diffuse_target(
     raise ValueError(f"Unknown diffuse mode: {mode}")
 
 
-def sample_self_reference_skin_rgb(
+def build_local_diffuse_target(
     sample: np.ndarray,
     exclude_gate: np.ndarray,
+    radius: float,
     bg_threshold: float = 8.0,
 ) -> np.ndarray:
-    """Estimates a flat skin RGB from the sample texture's own "clean" pixels.
+    """Reconstructs a spatially-varying diffuse target from the sample's own "clean" pixels.
 
-    Averages sample pixels outside ``exclude_gate`` — the union of every
-    enabled channel's gate plus the feature-preserve mask, i.e. whatever has
-    already been flagged as needing correction or as non-skin (eyes/mouth).
-    The remaining pixels are presumed-good mid-tone skin sourced from the
-    texture itself, sidestepping exposure/color mismatches against a
-    separately lit diffuse reference asset.
+    ``exclude_gate`` is the union of every enabled channel's gate plus the
+    feature-preserve mask — whatever has already been flagged as needing
+    correction or as non-skin (eyes/mouth). Rather than averaging the
+    remaining pixels into one flat RGB, this heavily blurs them into a
+    smooth low-frequency reconstruction that still varies across the face
+    (forehead curvature, falloff toward the temples, etc.). A single flat
+    color correcting a broad area produces a visible seam no matter how well
+    its spatial edge is feathered, because the flat patch and the naturally-
+    shaded skin around it are different *shapes* of color, not just
+    different colors — this keeps the correction following the same shape.
+
+    A blur this wide is expensive at full texture resolution and pointless
+    too, since only low-frequency content is wanted here anyway — so the
+    blur runs on a downsampled copy and is upsampled back afterward.
     """
     lum = luminance(sample)
-    keep = (lum > bg_threshold) & (exclude_gate <= 0.5)
-    if not np.any(keep):
+    valid = (lum > bg_threshold) & (exclude_gate <= 0.5)
+    if not np.any(valid):
         raise ValueError(
-            "Could not sample self-reference skin: nothing left outside the "
-            "enabled channel masks / feature-preserve mask. Loosen those masks "
-            "or use --diffuse-mode uv/palette instead."
+            "Could not build a self-reference diffuse target: nothing left "
+            "outside the enabled channel masks / feature-preserve mask. "
+            "Loosen those masks or use --diffuse-mode uv/palette instead."
         )
-    skin = sample[keep].astype(np.float32)
-    mean = skin.mean(axis=0)
+    weight = valid.astype(np.float32)
     logger.info(
-        "Self-reference skin RGB ≈ (%.1f, %.1f, %.1f) from %d pixels (%.1f%% of frame)",
-        mean[0], mean[1], mean[2], int(keep.sum()), 100.0 * float(keep.mean()),
+        "Self-mode diffuse target: reconstructed from %d clean px (%.1f%% of frame), locality radius=%.0fpx",
+        int(valid.sum()), 100.0 * float(valid.mean()), radius,
     )
-    return mean
+
+    h, w = sample.shape[:2]
+    scale = max(1, int(radius // 8))
+    small_size = (max(1, w // scale), max(1, h // scale))
+    small_radius = max(1.0, radius / scale)
+
+    rgb_small = cv2.resize(sample.astype(np.float32), small_size, interpolation=cv2.INTER_AREA)
+    weight_small = cv2.resize(weight, small_size, interpolation=cv2.INTER_AREA)
+    blurred_small = masked_gaussian_blur(rgb_small, weight_small, small_radius)
+    return resize_to(blurred_small, (h, w), nearest=False)
 
 
 # =============================================================================
@@ -409,13 +430,53 @@ def luminance_delta_mask(
     return weights
 
 
-def apply_blending_radius(mask: np.ndarray, radius: float) -> np.ndarray:
-    """Spatially softens the blend mask. ``radius`` is Gaussian sigma in pixels."""
+def apply_blending_radius(
+    mask: np.ndarray,
+    radius: float,
+    spill_outside: bool = False,
+) -> np.ndarray:
+    """Feathers ``mask``'s own edge over ``radius`` px without diluting its interior.
+
+    A plain Gaussian blur conserves total mass, not peak height — blurring a
+    mask footprint smaller than the blur kernel crushes its own interior
+    toward zero (a 20px blob blurred with a 64px sigma keeps only ~10% of its
+    original strength), which is backwards from what "soften the edges"
+    should do, and gets worse the larger ``radius`` is set.
+
+    This instead keeps every pixel more than ``radius`` px from ``mask``'s
+    own edge at its original value, and only tapers a ``radius``-px-wide band
+    straddling that edge, via a signed distance transform run through a
+    smoothstep. A larger radius then only widens the feather; it never
+    weakens the interior.
+
+    When ``spill_outside`` is set, the taper also extends past the mask's
+    own footprint, carrying the nearest interior value outward with it
+    (rather than fading from zero) so the spillover keeps real strength
+    instead of trailing off to nothing immediately.
+    """
     if radius <= 0:
         return mask
-    # Kernel size odd and large enough for the sigma.
-    k = int(max(3, round(radius * 6) // 2 * 2 + 1))
-    return cv2.GaussianBlur(mask, (k, k), radius)
+    footprint = mask > 1e-3
+    if not np.any(footprint):
+        return mask
+
+    if spill_outside:
+        extended = extend_texture_boundaries(
+            mask.astype(np.float32)[..., None], ~footprint, max_distance=None
+        )[..., 0]
+    else:
+        extended = mask.astype(np.float32)
+
+    dist_in = cv2.distanceTransform(footprint.astype(np.uint8), cv2.DIST_L2, 5)
+    dist_out = cv2.distanceTransform((~footprint).astype(np.uint8), cv2.DIST_L2, 5)
+    signed = dist_in - dist_out  # > 0 inside the footprint, < 0 outside
+    t = np.clip((signed + radius) / (2.0 * radius), 0.0, 1.0)
+    envelope = (t * t * (3.0 - 2.0 * t)).astype(np.float32)  # smoothstep
+
+    if not spill_outside:
+        envelope = envelope * footprint.astype(np.float32)
+
+    return np.clip(extended * envelope, 0.0, 1.0).astype(np.float32)
 
 
 def masked_gaussian_blur(
@@ -455,6 +516,20 @@ def build_correction_target(
     """
     diffuse_mix = float(np.clip(diffuse_mix, 0.0, 1.0))
     sample_f = sample.astype(np.float32)
+
+    if diffuse_mix >= 1.0 and diffuse_target is not None:
+        # Full diffuse override: skip building the local repaint entirely.
+        # `repaint * (1 - diffuse_mix)` alone is not a safe way to discard a
+        # bad repaint, because 0 * value only cancels ordinary numbers — a
+        # NaN/Inf pixel (e.g. from an infill search that had to reach
+        # unusually far across a broad, gently-fading mask, worst-case right
+        # at its own geometric center) survives multiplication by zero and
+        # would otherwise still leak into the result.
+        diff_f = diffuse_target.astype(np.float32)
+        if diff_f.shape[:2] != sample_f.shape[:2]:
+            diff_f = resize_to(diff_f, sample_f.shape[:2], nearest=False).astype(np.float32)
+        return diff_f
+
     if radius <= 0:
         repaint = sample_f
     elif use_infill:
@@ -519,11 +594,12 @@ def compute_channel_soft_mask(
         gate = gate * (1.0 - np.clip(feature_preserve, 0.0, 1.0))
 
     raw = luminance_delta_mask(working, diffuse_target, channel.threshold, gate)
-    soft = apply_blending_radius(raw, channel.radius)
-    if not channel.spill_outside:
-        soft = soft * gate
-    else:
+    soft = apply_blending_radius(raw, channel.radius, spill_outside=channel.spill_outside)
+    if channel.spill_outside:
+        # Still exclude true UV background even while spilling into neighbors.
         soft = soft * (luminance(working) >= 8.0).astype(np.float32)
+    else:
+        soft = soft * gate
     return soft
 
 
@@ -695,13 +771,16 @@ def process(
     luminance_only: bool = True,
     feature_preserve_path: Optional[str] = None,
     out_masks_dir: Optional[str] = None,
+    self_locality_radius: float = DEFAULT_SELF_LOCALITY_RADIUS,
 ) -> Dict[str, str]:
     """Runs every enabled mask channel in order over ``texture_path``.
 
     Each channel corrects the output of the previous one. The diffuse target
-    defaults to ``self`` mode: a flat skin color sampled from the texture's
-    own pixels outside every enabled channel's gate and outside the
-    feature-preserve mask.
+    defaults to ``self`` mode: a spatially-varying reconstruction (see
+    ``build_local_diffuse_target``) built from the texture's own pixels
+    outside every enabled channel's gate and outside the feature-preserve
+    mask, so broad corrections still follow the surrounding shading gradient
+    instead of flattening to one constant color.
     """
     sample = load_rgb(texture_path)
     palette = region_palette or DEFAULT_REGION_PALETTE
@@ -724,9 +803,7 @@ def process(
             exclude = np.maximum(exclude, compute_channel_gate(mask_imgs[ch.name], ch, palette))
         if feature_preserve is not None:
             exclude = np.maximum(exclude, feature_preserve)
-        skin_rgb = sample_self_reference_skin_rgb(sample, exclude)
-        diffuse_target = np.empty(sample.shape, dtype=np.float32)
-        diffuse_target[...] = skin_rgb
+        diffuse_target = build_local_diffuse_target(sample, exclude, self_locality_radius)
     else:
         if not diffuse_path:
             raise ValueError("diffuse_path is required unless diffuse_mode='self'.")
@@ -786,9 +863,16 @@ def main(argv: Optional[List[str]] = None) -> None:
         "--diffuse-mode",
         choices=("uv", "palette", "self"),
         default="self",
-        help="How to build the diffuse target. 'self' (default) averages the sample "
-             "texture's own pixels outside every enabled channel's gate and the "
-             "feature-preserve mask.",
+        help="How to build the diffuse target. 'self' (default) reconstructs a "
+             "spatially-varying target from the sample texture's own pixels outside "
+             "every enabled channel's gate and the feature-preserve mask.",
+    )
+    parser.add_argument(
+        "--self-locality-radius",
+        type=float,
+        default=DEFAULT_SELF_LOCALITY_RADIUS,
+        help="Blur radius (px) used to reconstruct the self-mode diffuse target's "
+             f"local shading gradient. Default: {DEFAULT_SELF_LOCALITY_RADIUS:.0f}.",
     )
     parser.add_argument(
         "--feature-preserve-mask",
@@ -838,6 +922,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         luminance_only=not args.full_rgb,
         feature_preserve_path=args.feature_preserve_mask,
         out_masks_dir=args.out_masks_dir,
+        self_locality_radius=args.self_locality_radius,
     )
 
 
