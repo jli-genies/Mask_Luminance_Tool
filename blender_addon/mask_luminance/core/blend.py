@@ -1,0 +1,888 @@
+"""Build a luminance-delta blend mask and optionally correct a sample albedo.
+
+Ported from the standalone ``matte_luminance_blend.py`` CLI tool. This module
+is the "core" layer in the Blender-addon sense: pure numpy/opencv, no ``bpy``
+import anywhere, so it is fully exercised by plain pytest without opening
+Blender. The addon's ``scene/`` layer is responsible for pulling pixels out of
+``bpy.types.Image`` datablocks and handing plain numpy arrays to the functions
+below, then writing the result back into a datablock.
+
+Any number of independent *mask channels* can be layered onto a sample
+texture. Each channel picks one mask image, a gate mode describing how that
+image selects pixels, and its own threshold / blur radius / diffuse strength /
+diffuse mix. Channels run in order, each correcting the output of the
+previous one, all through the same core algorithm: a soft luminance-delta
+mask (vs a diffuse target), feathered by a blur radius, then repainted via
+in_fill (nearest surrounding colors) or a local blur, optionally mixed toward
+the diffuse target.
+
+The diffuse target defaults to ``self`` mode: a flat skin color sampled from
+the sample texture's own clean pixels (those outside every enabled channel's
+gate and outside the feature-preserve mask), so no separate diffuse asset is
+required.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
+import cv2
+import numpy as np
+
+from .infill import apply_extrapolation_blur, extend_texture_boundaries
+
+logger = logging.getLogger(__name__)
+
+# Default ID colors from the authored region mask (quantized / approximate).
+# Used only by "color_id" gate-mode channels (e.g. mask_concept_texture.png).
+DEFAULT_REGION_PALETTE: Dict[str, Tuple[int, int, int]] = {
+    "forehead": (200, 16, 120),   # magenta
+    "jaw_cheeks": (232, 232, 232),  # white / light grey
+    "back_head": (56, 200, 248),  # cyan
+}
+
+GATE_MODES = ("weight", "blue_paint", "color_id")
+
+# Default blur radius (px) for reconstructing the "self" diffuse target's
+# local shading gradient — see build_local_diffuse_target().
+DEFAULT_SELF_LOCALITY_RADIUS = 250.0
+
+
+# =============================================================================
+# MASK CHANNEL CONFIG
+# =============================================================================
+@dataclass
+class MaskChannel:
+    """One independently controllable mask-driven correction pass.
+
+    Attributes:
+        name: Display / output name. Defaults to the mask filename stem.
+        mask_path: Path to the mask image driving this channel.
+        enabled: Whether this channel runs at all.
+        gate_mode: How ``mask_path`` selects pixels —
+            "weight": grayscale luminance/255 as a soft gate (default).
+            "blue_paint": blue-dominant paint on a UV map marks the gate
+                (e.g. body_mat_mask_C_highlights_00.png).
+            "color_id": ``mask_path`` is a multi-region ID color map;
+                ``regions``/``region_tolerance`` select which named regions
+                (from the palette) participate.
+        threshold: Minimum |luminance(sample) - luminance(diffuse_target)|
+            (0-255) before a gated pixel enters the mask.
+        radius: Gaussian sigma (px) used both to feather the mask and (when
+            not using infill) to locally blur the correction target.
+        strength: Overall blend-in amount of the correction (0-1).
+        diffuse_mix: Fraction of the correction target taken from the flat
+            diffuse target (0 = local blur/infill only, 1 = full diffuse).
+        use_infill: Build the correction target via in_fill (nearest
+            surrounding colors pushed into the masked region) instead of a
+            plain Gaussian blur. Default on, per the shared core algorithm.
+        spill_outside: Allow the feathered mask to spread into neighboring
+            pixels outside the gate rather than being re-clipped to it.
+        fill_holes: Only meaningful for gate_mode="weight". Flood-fills
+            enclosed holes in the mask (e.g. a face-oval cutout inside a
+            white ring) so the gate covers the full interior, not just the
+            painted ring.
+        regions: gate_mode="color_id" only — subset of palette region names
+            to include. None means all.
+        region_tolerance: gate_mode="color_id" only — RGB tolerance when
+            matching ID mask colors.
+        blend_group: Optional group name. Channels sharing the same non-empty
+            group are not applied sequentially (one on top of the other's
+            output); instead each computes its own correction independently
+            against the same input and the results are composited together,
+            weighted by each channel's own coverage — see ``apply_blend_group``.
+            Every other parameter above still applies per-channel as usual.
+        blend_weight: Relative contribution of this channel within its
+            ``blend_group`` when two channels' coverage overlaps. Ignored
+            for channels with no blend_group.
+    """
+
+    name: str
+    mask_path: str
+    enabled: bool = False
+    gate_mode: str = "weight"
+    threshold: float = 12.0
+    radius: float = 8.0
+    strength: float = 0.85
+    diffuse_mix: float = 0.0
+    use_infill: bool = True
+    spill_outside: bool = False
+    fill_holes: bool = False
+    regions: Optional[Sequence[str]] = None
+    region_tolerance: int = 40
+    blend_group: Optional[str] = None
+    blend_weight: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.gate_mode not in GATE_MODES:
+            raise ValueError(f"Unknown gate_mode '{self.gate_mode}'. Known: {GATE_MODES}")
+
+
+# =============================================================================
+# I/O
+# =============================================================================
+def load_rgb(path: str) -> np.ndarray:
+    """Loads an image as uint8 RGB (drops alpha if present)."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError(f"Failed to read image: {path}")
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.shape[2] == 4:
+        img = img[:, :, :3]
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def save_rgb(path: str, rgb: np.ndarray) -> None:
+    """Writes an RGB or single-channel uint8 image."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    arr = np.clip(rgb, 0, 255).astype(np.uint8)
+    if arr.ndim == 2:
+        ok = cv2.imwrite(path, arr)
+    else:
+        ok = cv2.imwrite(path, cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
+    if not ok:
+        raise IOError(f"Failed to write: {path}")
+
+
+def resize_to(img: np.ndarray, size_hw: Tuple[int, int], nearest: bool = False) -> np.ndarray:
+    """Resizes to (height, width)."""
+    h, w = size_hw
+    if img.shape[0] == h and img.shape[1] == w:
+        return img
+    interp = cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR
+    return cv2.resize(img, (w, h), interpolation=interp)
+
+
+# =============================================================================
+# COLOR / LUMINANCE
+# =============================================================================
+def luminance(rgb: np.ndarray) -> np.ndarray:
+    """Rec. 709 luminance, float32."""
+    rgb = rgb.astype(np.float32)
+    return 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+
+
+def rgb_to_ycbcr(rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Splits RGB into Y, Cb, Cr (float32), Rec. 709 throughout.
+
+    Cb/Cr scale factors are ``1 / (2*(1-Kb))`` and ``1 / (2*(1-Kr))`` for the
+    same Rec. 709 Kb/Kr used by ``luminance()``. Using BT.601's constants
+    here (0.564/0.713) while ``luminance()`` is BT.709 made the encode/decode
+    round trip lossy — R and B happened to nearly cancel out, but G did not,
+    so every "luminance-only" blend silently pushed a magenta/green cast into
+    the result.
+    """
+    rgb = rgb.astype(np.float32)
+    y = luminance(rgb)
+    cb = (rgb[..., 2] - y) * 0.5389 + 128.0
+    cr = (rgb[..., 0] - y) * 0.6350 + 128.0
+    return y, cb, cr
+
+
+def ycbcr_to_rgb(y: np.ndarray, cb: np.ndarray, cr: np.ndarray) -> np.ndarray:
+    """Reconstructs RGB from Y, Cb, Cr (Rec. 709; inverse of ``rgb_to_ycbcr``)."""
+    r = y + 1.5748 * (cr - 128.0)
+    g = y - 0.1873 * (cb - 128.0) - 0.4681 * (cr - 128.0)
+    b = y + 1.8556 * (cb - 128.0)
+    return np.stack([r, g, b], axis=-1)
+
+
+# =============================================================================
+# REGION / DIFFUSE TARGETS
+# =============================================================================
+def color_id_mask(
+    id_map: np.ndarray,
+    rgb: Sequence[int],
+    tolerance: int = 40,
+) -> np.ndarray:
+    """Binary float mask for pixels matching an ID color within tolerance."""
+    diff = np.abs(id_map.astype(np.int16) - np.asarray(rgb, dtype=np.int16))
+    return (diff.max(axis=-1) <= tolerance).astype(np.float32)
+
+
+def build_region_gate(
+    id_map: np.ndarray,
+    palette: Dict[str, Tuple[int, int, int]],
+    tolerance: int = 40,
+    active: Optional[Sequence[str]] = None,
+) -> np.ndarray:
+    """Union of selected ID regions."""
+    gate = np.zeros(id_map.shape[:2], dtype=np.float32)
+    names = list(active) if active else list(palette.keys())
+    for name in names:
+        if name not in palette:
+            raise KeyError(f"Unknown region '{name}'. Known: {sorted(palette)}")
+        gate = np.maximum(gate, color_id_mask(id_map, palette[name], tolerance))
+    return gate
+
+
+def sample_palette_skin_rgb(
+    palette_img: np.ndarray,
+    bg_threshold: int = 245,
+    bg_tolerance: int = 24,
+) -> np.ndarray:
+    """Estimates a flat skin RGB from a multiview / palette render.
+
+    The studio background is not assumed to be white: it is sampled from the
+    image corners (flat studio backdrops, whatever their color, sit there)
+    and excluded by color distance. A gray/colored backdrop that a plain
+    near-white check would miss previously got averaged in as "skin" and
+    dragged the estimate toward the backdrop color. Near-black pixels
+    (line art / deep shadow) and near-white blowouts are still dropped too.
+    """
+    corner_px = np.concatenate([
+        palette_img[:8, :8].reshape(-1, 3),
+        palette_img[:8, -8:].reshape(-1, 3),
+        palette_img[-8:, :8].reshape(-1, 3),
+        palette_img[-8:, -8:].reshape(-1, 3),
+    ]).astype(np.float32)
+    bg_color = np.median(corner_px, axis=0)
+
+    dist_to_bg = np.abs(palette_img.astype(np.float32) - bg_color).max(axis=-1)
+    lum = luminance(palette_img)
+    keep = (dist_to_bg > bg_tolerance) & (lum > 15.0) & (lum < bg_threshold)
+    if not np.any(keep):
+        raise ValueError("Could not sample skin from diffuse palette (no non-background pixels).")
+    skin = palette_img[keep].astype(np.float32)
+    mean = skin.mean(axis=0)
+    logger.info(
+        "Detected palette background ≈ (%.0f, %.0f, %.0f); skin RGB ≈ (%.1f, %.1f, %.1f) from %d pixels",
+        bg_color[0], bg_color[1], bg_color[2], mean[0], mean[1], mean[2], int(keep.sum()),
+    )
+    return mean
+
+
+def make_diffuse_target(
+    sample: np.ndarray,
+    diffuse: np.ndarray,
+    mode: str,
+) -> np.ndarray:
+    """Builds a per-pixel diffuse target in the sample's resolution.
+
+    Modes:
+        uv      – ``diffuse`` is a UV map; resized to sample size.
+        palette – ``diffuse`` is a flat multiview/palette image; fill UV with
+                  sampled mean skin color (keeps sample chroma via Y swap later).
+
+    ``self`` mode (deriving the target from the sample itself rather than an
+    external diffuse asset) is handled by ``build_local_diffuse_target`` in
+    ``process()``, since it needs the union of enabled channel gates.
+    """
+    if mode == "uv":
+        return resize_to(diffuse, sample.shape[:2], nearest=False).astype(np.float32)
+
+    if mode == "palette":
+        skin = sample_palette_skin_rgb(diffuse)
+        target = np.empty(sample.shape, dtype=np.float32)
+        target[...] = skin
+        return target
+
+    raise ValueError(f"Unknown diffuse mode: {mode}")
+
+
+def build_local_diffuse_target(
+    sample: np.ndarray,
+    exclude_gate: np.ndarray,
+    radius: float,
+    bg_threshold: float = 8.0,
+) -> np.ndarray:
+    """Reconstructs a spatially-varying diffuse target from the sample's own "clean" pixels.
+
+    ``exclude_gate`` is the union of every enabled channel's gate plus the
+    feature-preserve mask — whatever has already been flagged as needing
+    correction or as non-skin (eyes/mouth). Rather than averaging the
+    remaining pixels into one flat RGB, this heavily blurs them into a
+    smooth low-frequency reconstruction that still varies across the face
+    (forehead curvature, falloff toward the temples, etc.). A single flat
+    color correcting a broad area produces a visible seam no matter how well
+    its spatial edge is feathered, because the flat patch and the naturally-
+    shaded skin around it are different *shapes* of color, not just
+    different colors — this keeps the correction following the same shape.
+
+    A blur this wide is expensive at full texture resolution and pointless
+    too, since only low-frequency content is wanted here anyway — so the
+    blur runs on a downsampled copy and is upsampled back afterward.
+    """
+    lum = luminance(sample)
+    valid = (lum > bg_threshold) & (exclude_gate <= 0.5)
+    if not np.any(valid):
+        raise ValueError(
+            "Could not build a self-reference diffuse target: nothing left "
+            "outside the enabled channel masks / feature-preserve mask. "
+            "Loosen those masks or use diffuse_mode='uv'/'palette' instead."
+        )
+    weight = valid.astype(np.float32)
+    logger.info(
+        "Self-mode diffuse target: reconstructed from %d clean px (%.1f%% of frame), locality radius=%.0fpx",
+        int(valid.sum()), 100.0 * float(valid.mean()), radius,
+    )
+
+    h, w = sample.shape[:2]
+    scale = max(1, int(radius // 8))
+    small_size = (max(1, w // scale), max(1, h // scale))
+    small_radius = max(1.0, radius / scale)
+
+    rgb_small = cv2.resize(sample.astype(np.float32), small_size, interpolation=cv2.INTER_AREA)
+    weight_small = cv2.resize(weight, small_size, interpolation=cv2.INTER_AREA)
+    blurred_small = masked_gaussian_blur(rgb_small, weight_small, small_radius)
+    return resize_to(blurred_small, (h, w), nearest=False)
+
+
+# =============================================================================
+# GATES (per mask channel)
+# =============================================================================
+def composite_weights(mask_img: np.ndarray) -> np.ndarray:
+    """Grayscale gate weights in [0, 1] from a mask image."""
+    return (luminance(mask_img) / 255.0).astype(np.float32)
+
+
+def composite_skin_envelope(
+    mask_img: np.ndarray,
+    support_min: float = 1.0 / 255.0,
+) -> np.ndarray:
+    """Grayscale gate including enclosed holes (e.g. a face oval cutout).
+
+    Some masks paint a ring around the region of interest with a hole in the
+    middle (e.g. the composite skin mask's face oval). Flood-fill identifies
+    those enclosed holes so the gate covers the full interior.
+    """
+    weights = composite_weights(mask_img)
+    binary = (weights >= support_min).astype(np.uint8)
+    if not np.any(binary):
+        return binary.astype(np.float32)
+
+    h, w = binary.shape
+    inv = (1 - binary).astype(np.uint8)
+    flood = inv.copy()
+    ff_mask = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.floodFill(flood, ff_mask, (0, 0), 2)
+    holes = (flood == 1).astype(np.float32)
+    return np.clip(binary.astype(np.float32) + holes, 0.0, 1.0)
+
+
+def extract_blue_paint_mask(
+    paint_map: np.ndarray,
+    min_blue: int = 100,
+    blue_margin: int = 40,
+) -> np.ndarray:
+    """Extracts a float gate from blue-painted areas on a UV paint map.
+
+    Pixels where blue dominates red/green (as in an authored highlight mask)
+    become 1; everything else 0.
+    """
+    r = paint_map[..., 0].astype(np.int16)
+    g = paint_map[..., 1].astype(np.int16)
+    b = paint_map[..., 2].astype(np.int16)
+    blue = (b >= min_blue) & (b > r + blue_margin) & (b > g + blue_margin)
+    return blue.astype(np.float32)
+
+
+def compute_channel_gate(
+    mask_img: np.ndarray,
+    channel: MaskChannel,
+    palette: Dict[str, Tuple[int, int, int]],
+) -> np.ndarray:
+    """Resolves one channel's gate (0-1 weights) from its mask image."""
+    if channel.gate_mode == "blue_paint":
+        return extract_blue_paint_mask(mask_img)
+    if channel.gate_mode == "color_id":
+        return build_region_gate(mask_img, palette, channel.region_tolerance, channel.regions)
+    return composite_skin_envelope(mask_img) if channel.fill_holes else composite_weights(mask_img)
+
+
+# =============================================================================
+# MASK + BLEND
+# =============================================================================
+def luminance_delta_mask(
+    sample: np.ndarray,
+    diffuse_target: np.ndarray,
+    threshold: float,
+    gate: np.ndarray,
+) -> np.ndarray:
+    """Soft-threshold mask where |L_sample - L_diffuse| exceeds ``threshold``.
+
+    Returns float32 weights in [0, 1]. Values below the threshold are 0; above
+    they ramp toward 1 based on how far they exceed the threshold (capped).
+    """
+    d_l = np.abs(luminance(sample) - luminance(diffuse_target))
+    # Hard gate: only pixels past the threshold participate.
+    over = np.maximum(d_l - threshold, 0.0)
+    # Soft ramp: full weight once delta is 2x the threshold past the cut.
+    ramp = threshold if threshold > 1e-6 else 1.0
+    weights = np.clip(over / ramp, 0.0, 1.0).astype(np.float32)
+    weights *= gate.astype(np.float32)
+
+    # Ignore empty UV background (near-black on sample).
+    bg = luminance(sample) < 8.0
+    weights[bg] = 0.0
+    return weights
+
+
+def apply_blending_radius(
+    mask: np.ndarray,
+    radius: float,
+    spill_outside: bool = False,
+) -> np.ndarray:
+    """Feathers ``mask``'s own edge over ``radius`` px without diluting its interior.
+
+    A plain Gaussian blur conserves total mass, not peak height — blurring a
+    mask footprint smaller than the blur kernel crushes its own interior
+    toward zero (a 20px blob blurred with a 64px sigma keeps only ~10% of its
+    original strength), which is backwards from what "soften the edges"
+    should do, and gets worse the larger ``radius`` is set.
+
+    This instead keeps every pixel more than ``radius`` px from ``mask``'s
+    own edge at its original value, and only tapers a ``radius``-px-wide band
+    straddling that edge, via a signed distance transform run through a
+    smoothstep. A larger radius then only widens the feather; it never
+    weakens the interior.
+
+    When ``spill_outside`` is set, the taper also extends past the mask's
+    own footprint, carrying the nearest interior value outward with it
+    (rather than fading from zero) so the spillover keeps real strength
+    instead of trailing off to nothing immediately.
+    """
+    if radius <= 0:
+        return mask
+    footprint = mask > 1e-3
+    if not np.any(footprint):
+        return mask
+
+    if spill_outside:
+        extended = extend_texture_boundaries(
+            mask.astype(np.float32)[..., None], ~footprint, max_distance=None
+        )[..., 0]
+    else:
+        extended = mask.astype(np.float32)
+
+    dist_in = cv2.distanceTransform(footprint.astype(np.uint8), cv2.DIST_L2, 5)
+    dist_out = cv2.distanceTransform((~footprint).astype(np.uint8), cv2.DIST_L2, 5)
+    signed = dist_in - dist_out  # > 0 inside the footprint, < 0 outside
+    t = np.clip((signed + radius) / (2.0 * radius), 0.0, 1.0)
+    envelope = (t * t * (3.0 - 2.0 * t)).astype(np.float32)  # smoothstep
+
+    if not spill_outside:
+        envelope = envelope * footprint.astype(np.float32)
+
+    return np.clip(extended * envelope, 0.0, 1.0).astype(np.float32)
+
+
+def masked_gaussian_blur(
+    rgb: np.ndarray,
+    weight_mask: np.ndarray,
+    radius: float,
+) -> np.ndarray:
+    """Blur ``rgb`` weighted by ``weight_mask`` so black UV gutters are not pulled in."""
+    if radius <= 0:
+        return rgb.astype(np.float32)
+    k = int(max(3, round(radius * 6) // 2 * 2 + 1))
+    m = weight_mask.astype(np.float32)
+    rgb_f = rgb.astype(np.float32)
+    num = cv2.GaussianBlur(rgb_f * m[..., None], (k, k), radius)
+    # cv2.GaussianBlur on a single-channel map returns (H, W), not (H, W, 1).
+    den = cv2.GaussianBlur(m, (k, k), radius)[..., None]
+    return num / np.maximum(den, 1e-4)
+
+
+def build_correction_target(
+    sample: np.ndarray,
+    mask: np.ndarray,
+    radius: float,
+    diffuse_target: Optional[np.ndarray] = None,
+    diffuse_mix: float = 0.0,
+    use_infill: bool = True,
+) -> np.ndarray:
+    """Builds the full-image correction color a mask channel would blend toward.
+
+    ``target = (1 - diffuse_mix) * local_repaint + diffuse_mix * diffuse``.
+    This is the "core in_fill algorithm" shared by every mask channel: pushes
+    the nearest surrounding (unmasked) colors into the masked region (see
+    ``core.infill``) rather than Gaussian-blurring the sample in place, since a
+    plain local blur only softens a bright/mismatched patch — its own color
+    stays baked into the kernel average near the center — while infill
+    actually replaces the patch with the surrounding skin tone.
+    """
+    diffuse_mix = float(np.clip(diffuse_mix, 0.0, 1.0))
+    sample_f = sample.astype(np.float32)
+
+    if diffuse_mix >= 1.0 and diffuse_target is not None:
+        # Full diffuse override: skip building the local repaint entirely.
+        # `repaint * (1 - diffuse_mix)` alone is not a safe way to discard a
+        # bad repaint, because 0 * value only cancels ordinary numbers — a
+        # NaN/Inf pixel (e.g. from an infill search that had to reach
+        # unusually far across a broad, gently-fading mask, worst-case right
+        # at its own geometric center) survives multiplication by zero and
+        # would otherwise still leak into the result.
+        diff_f = diffuse_target.astype(np.float32)
+        if diff_f.shape[:2] != sample_f.shape[:2]:
+            diff_f = resize_to(diff_f, sample_f.shape[:2], nearest=False).astype(np.float32)
+        return diff_f
+
+    if radius <= 0:
+        repaint = sample_f
+    elif use_infill:
+        holes = mask.astype(np.float32) > 0.01
+        repaint = extend_texture_boundaries(sample_f, holes, max_distance=None)
+        repaint = apply_extrapolation_blur(repaint, holes, radius)
+    else:
+        k = int(max(3, round(radius * 6) // 2 * 2 + 1))
+        repaint = cv2.GaussianBlur(sample_f, (k, k), radius)
+
+    if diffuse_mix <= 0.0 or diffuse_target is None:
+        return repaint
+
+    diff_f = diffuse_target.astype(np.float32)
+    if diff_f.shape[:2] != sample_f.shape[:2]:
+        diff_f = resize_to(diff_f, sample_f.shape[:2], nearest=False).astype(np.float32)
+    return repaint * (1.0 - diffuse_mix) + diff_f * diffuse_mix
+
+
+def correct_region(
+    sample: np.ndarray,
+    mask: np.ndarray,
+    radius: float,
+    strength: float,
+    diffuse_target: Optional[np.ndarray] = None,
+    diffuse_mix: float = 0.0,
+    luminance_only: bool = True,
+    use_infill: bool = True,
+) -> np.ndarray:
+    """Blends ``sample`` toward ``build_correction_target(...)`` by ``mask * strength``.
+
+    This is the standalone (non-blend-group) application of the shared core
+    algorithm — see ``build_correction_target`` for what the target is.
+    """
+    target = build_correction_target(sample, mask, radius, diffuse_target, diffuse_mix, use_infill)
+    strength = float(np.clip(strength, 0.0, 1.0))
+    w = np.clip(mask.astype(np.float32) * strength, 0.0, 1.0)
+
+    sample_f = sample.astype(np.float32)
+    if luminance_only:
+        y_s, cb, cr = rgb_to_ycbcr(sample_f)
+        y_t = luminance(target)
+        y_out = y_s * (1.0 - w) + y_t * w
+        out = ycbcr_to_rgb(y_out, cb, cr)
+    else:
+        out = sample_f * (1.0 - w[..., None]) + target * w[..., None]
+
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def compute_channel_soft_mask(
+    working: np.ndarray,
+    diffuse_target: np.ndarray,
+    mask_img: np.ndarray,
+    channel: MaskChannel,
+    palette: Dict[str, Tuple[int, int, int]],
+    feature_preserve: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Resolves one channel's soft weight mask: gate -> threshold -> feather."""
+    gate = compute_channel_gate(mask_img, channel, palette)
+    if feature_preserve is not None:
+        gate = gate * (1.0 - np.clip(feature_preserve, 0.0, 1.0))
+
+    raw = luminance_delta_mask(working, diffuse_target, channel.threshold, gate)
+    soft = apply_blending_radius(raw, channel.radius, spill_outside=channel.spill_outside)
+    if channel.spill_outside:
+        # Still exclude true UV background even while spilling into neighbors.
+        soft = soft * (luminance(working) >= 8.0).astype(np.float32)
+    else:
+        soft = soft * gate
+    return soft
+
+
+def apply_mask_channel(
+    working: np.ndarray,
+    diffuse_target: np.ndarray,
+    mask_img: np.ndarray,
+    channel: MaskChannel,
+    palette: Dict[str, Tuple[int, int, int]],
+    luminance_only: bool = True,
+    feature_preserve: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Runs one mask channel's full pass: gate -> threshold -> feather -> correct.
+
+    Returns the updated working texture and the channel's soft weight mask
+    (post-feather, pre-strength — useful for debug output).
+    """
+    soft = compute_channel_soft_mask(working, diffuse_target, mask_img, channel, palette, feature_preserve)
+    new_working = correct_region(
+        working,
+        soft,
+        channel.radius,
+        channel.strength,
+        diffuse_target=diffuse_target if channel.diffuse_mix > 0.0 else None,
+        diffuse_mix=channel.diffuse_mix,
+        luminance_only=luminance_only,
+        use_infill=channel.use_infill,
+    )
+    return new_working, soft
+
+
+def composite_correction_targets(
+    sample: np.ndarray,
+    targets: Sequence[np.ndarray],
+    weights: Sequence[np.ndarray],
+    luminance_only: bool = True,
+) -> np.ndarray:
+    """Alpha-composites ``sample`` with a weighted blend of several correction targets.
+
+    ``weights[i]`` is channel i's own contribution weight at each pixel
+    (its soft mask already scaled by its strength and blend_weight). A pixel
+    touched by only one channel keeps that channel's own correction
+    unchanged; a pixel touched by several blends proportionally between
+    their targets instead of one channel overwriting another's result.
+    """
+    stack_w = np.clip(np.stack(weights, axis=0), 0.0, 1.0)
+    total_w = np.maximum(stack_w.sum(axis=0), 1e-6)
+    # Union coverage (screen-combine) so overlap never exceeds full strength.
+    combined_w = np.clip(1.0 - np.prod(1.0 - stack_w, axis=0), 0.0, 1.0)
+
+    sample_f = sample.astype(np.float32)
+    if luminance_only:
+        y_s, cb, cr = rgb_to_ycbcr(sample_f)
+        y_targets = np.stack([luminance(t) for t in targets], axis=0)
+        blended_y = (y_targets * stack_w).sum(axis=0) / total_w
+        y_out = y_s * (1.0 - combined_w) + blended_y * combined_w
+        out = ycbcr_to_rgb(y_out, cb, cr)
+    else:
+        stack_t = np.stack([t.astype(np.float32) for t in targets], axis=0)
+        blended = (stack_t * stack_w[..., None]).sum(axis=0) / total_w[..., None]
+        out = sample_f * (1.0 - combined_w[..., None]) + blended * combined_w[..., None]
+
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def apply_blend_group(
+    working: np.ndarray,
+    diffuse_target: np.ndarray,
+    mask_imgs: Dict[str, np.ndarray],
+    group_channels: Sequence[MaskChannel],
+    palette: Dict[str, Tuple[int, int, int]],
+    luminance_only: bool = True,
+    feature_preserve: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Blends several channels' independent corrections into one result.
+
+    Each channel in ``group_channels`` computes its own gate, threshold,
+    radius, diffuse_mix and use_infill exactly as it would standalone — all
+    against the same shared ``working`` input rather than chained onto each
+    other's output. The corrected results are then combined per pixel via
+    ``composite_correction_targets``, weighted by each channel's own coverage
+    (soft mask * strength * blend_weight), so individual per-channel control
+    is preserved everywhere except the overlap, which blends smoothly instead
+    of one channel hard-overwriting the other.
+    """
+    targets: List[np.ndarray] = []
+    weights: List[np.ndarray] = []
+    soft_masks: Dict[str, np.ndarray] = {}
+
+    for ch in group_channels:
+        soft = compute_channel_soft_mask(working, diffuse_target, mask_imgs[ch.name], ch, palette, feature_preserve)
+        soft_masks[ch.name] = soft
+        target = build_correction_target(
+            working,
+            soft,
+            ch.radius,
+            diffuse_target=diffuse_target if ch.diffuse_mix > 0.0 else None,
+            diffuse_mix=ch.diffuse_mix,
+            use_infill=ch.use_infill,
+        )
+        targets.append(target)
+        strength = float(np.clip(ch.strength, 0.0, 1.0))
+        weights.append(soft * strength * max(ch.blend_weight, 0.0))
+
+    new_working = composite_correction_targets(working, targets, weights, luminance_only)
+    return new_working, soft_masks
+
+
+# =============================================================================
+# TOP-LEVEL PROCESS
+# =============================================================================
+def group_active_channels(
+    active_channels: Sequence[MaskChannel],
+) -> List[Union[MaskChannel, List[MaskChannel]]]:
+    """Groups ``active_channels`` into the ordered work items ``run_channel_pipeline`` applies.
+
+    A channel with no ``blend_group`` is its own work item; channels sharing
+    a ``blend_group`` collapse into one work item (deduplicated, at the
+    position of their first occurrence) so they're applied together via
+    ``apply_blend_group`` instead of one overwriting another's output.
+
+    Factored out of ``run_channel_pipeline`` so the addon's stepped/modal
+    bake operator (``scene/bake.py``) can process one work item per timer
+    tick — each item is exactly one call to ``apply_mask_channel`` or
+    ``apply_blend_group`` — while ``run_channel_pipeline`` itself still runs
+    every item synchronously for the CLI/tests.
+    """
+    items: List[Union[MaskChannel, List[MaskChannel]]] = []
+    seen_groups = set()
+
+    for ch in active_channels:
+        if ch.blend_group:
+            if ch.blend_group in seen_groups:
+                continue
+            seen_groups.add(ch.blend_group)
+            items.append([c for c in active_channels if c.blend_group == ch.blend_group])
+        else:
+            items.append(ch)
+
+    return items
+
+
+def run_channel_pipeline(
+    working: np.ndarray,
+    diffuse_target: np.ndarray,
+    mask_imgs: Dict[str, np.ndarray],
+    active_channels: Sequence[MaskChannel],
+    palette: Dict[str, Tuple[int, int, int]],
+    luminance_only: bool = True,
+    feature_preserve: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Runs every enabled channel over ``working``, in order.
+
+    Channels with no ``blend_group`` are applied sequentially, each
+    correcting the previous one's output. Channels sharing a ``blend_group``
+    name are instead run together through ``apply_blend_group`` the first
+    time any of them is reached, so their results blend by coverage instead
+    of overwriting each other. Returns the final texture and each channel's
+    soft mask (for debug output).
+    """
+    working = working.copy()
+    channel_masks: Dict[str, np.ndarray] = {}
+
+    for item in group_active_channels(active_channels):
+        if isinstance(item, list):
+            working, group_soft = apply_blend_group(
+                working, diffuse_target, mask_imgs, item, palette, luminance_only, feature_preserve,
+            )
+            channel_masks.update(group_soft)
+            logger.info(
+                "Applied blend group '%s' (%s)", item[0].blend_group, ", ".join(c.name for c in item),
+            )
+        else:
+            ch = item
+            working, soft = apply_mask_channel(
+                working, diffuse_target, mask_imgs[ch.name], ch, palette, luminance_only, feature_preserve,
+            )
+            channel_masks[ch.name] = soft
+            logger.info(
+                "Applied channel '%s' (gate=%s, threshold=%.1f, radius=%.1f, strength=%.2f, "
+                "diffuse_mix=%.0f%%, infill=%s, active px=%.1f%%)",
+                ch.name, ch.gate_mode, ch.threshold, ch.radius, ch.strength,
+                100.0 * ch.diffuse_mix, ch.use_infill, 100.0 * float((soft > 0.01).mean()),
+            )
+
+    return working, channel_masks
+
+
+def process_arrays(
+    sample: np.ndarray,
+    channels: Sequence[MaskChannel],
+    mask_imgs: Dict[str, np.ndarray],
+    diffuse_mode: str = "self",
+    diffuse_img: Optional[np.ndarray] = None,
+    region_palette: Optional[Dict[str, Tuple[int, int, int]]] = None,
+    luminance_only: bool = True,
+    feature_preserve_img: Optional[np.ndarray] = None,
+    self_locality_radius: float = DEFAULT_SELF_LOCALITY_RADIUS,
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Array-in/array-out version of ``process()`` — no file paths anywhere.
+
+    This is what the addon's ``scene/bake.py`` calls: ``sample``/``mask_imgs``/
+    ``diffuse_img``/``feature_preserve_img`` come straight from
+    ``bpy.types.Image`` pixel buffers (already resized to the sample's
+    resolution by the caller), and the returned texture goes straight back
+    into an Image datablock. See ``process()`` for the file-path-based
+    equivalent used by the CLI/tests.
+    """
+    palette = region_palette or DEFAULT_REGION_PALETTE
+    active = [ch for ch in channels if ch.enabled]
+
+    feature_preserve = None
+    if feature_preserve_img is not None:
+        feature_preserve = composite_weights(feature_preserve_img)
+
+    if diffuse_mode == "self":
+        exclude = np.zeros(sample.shape[:2], dtype=np.float32)
+        for ch in active:
+            exclude = np.maximum(exclude, compute_channel_gate(mask_imgs[ch.name], ch, palette))
+        if feature_preserve is not None:
+            exclude = np.maximum(exclude, feature_preserve)
+        diffuse_target = build_local_diffuse_target(sample, exclude, self_locality_radius)
+    else:
+        if diffuse_img is None:
+            raise ValueError("diffuse_img is required unless diffuse_mode='self'.")
+        diffuse_target = make_diffuse_target(sample, diffuse_img, diffuse_mode)
+
+    return run_channel_pipeline(sample, diffuse_target, mask_imgs, active, palette, luminance_only, feature_preserve)
+
+
+def process(
+    texture_path: str,
+    channels: Sequence[MaskChannel],
+    out_texture_path: Optional[str] = None,
+    diffuse_path: Optional[str] = None,
+    diffuse_mode: str = "self",
+    region_palette: Optional[Dict[str, Tuple[int, int, int]]] = None,
+    luminance_only: bool = True,
+    feature_preserve_path: Optional[str] = None,
+    out_masks_dir: Optional[str] = None,
+    self_locality_radius: float = DEFAULT_SELF_LOCALITY_RADIUS,
+) -> Dict[str, str]:
+    """File-path-based orchestration, kept for CLI/test parity with the original tool.
+
+    Loads everything from disk, delegates to ``process_arrays`` for the actual
+    algorithm, then writes the results back out. The addon itself never calls
+    this — see ``process_arrays``.
+    """
+    sample = load_rgb(texture_path)
+    palette = region_palette or DEFAULT_REGION_PALETTE
+    active = [ch for ch in channels if ch.enabled]
+
+    mask_imgs: Dict[str, np.ndarray] = {}
+    for ch in active:
+        nearest = ch.gate_mode in ("blue_paint", "color_id")
+        mask_imgs[ch.name] = resize_to(load_rgb(ch.mask_path), sample.shape[:2], nearest=nearest)
+
+    feature_preserve_img = None
+    if feature_preserve_path:
+        feature_preserve_img = resize_to(load_rgb(feature_preserve_path), sample.shape[:2], nearest=False)
+
+    diffuse_img = None
+    if diffuse_mode != "self":
+        if not diffuse_path:
+            raise ValueError("diffuse_path is required unless diffuse_mode='self'.")
+        diffuse_img = load_rgb(diffuse_path)
+
+    working, channel_masks = process_arrays(
+        sample,
+        channels,
+        mask_imgs,
+        diffuse_mode=diffuse_mode,
+        diffuse_img=diffuse_img,
+        region_palette=palette,
+        luminance_only=luminance_only,
+        feature_preserve_img=feature_preserve_img,
+        self_locality_radius=self_locality_radius,
+    )
+
+    results: Dict[str, str] = {}
+    if out_masks_dir:
+        for name, soft in channel_masks.items():
+            path = os.path.join(out_masks_dir, f"{name}_mask.png")
+            save_rgb(path, np.clip(soft * 255.0, 0, 255).astype(np.uint8))
+            results[f"mask:{name}"] = path
+
+    if out_texture_path:
+        save_rgb(out_texture_path, working)
+        logger.info("Wrote corrected texture -> %s", out_texture_path)
+        results["texture"] = out_texture_path
+
+    return results

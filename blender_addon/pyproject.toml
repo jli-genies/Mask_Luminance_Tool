@@ -1,0 +1,3 @@
+[tool.pytest.ini_options]
+testpaths = ["mask_luminance/tests"]
+pythonpath = ["."]

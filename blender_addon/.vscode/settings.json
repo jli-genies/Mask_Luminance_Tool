@@ -1,0 +1,7 @@
+{
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+    "blender.addon.reloadOnSave": true,
+    "blender.environmentVariables": {
+        "BLENDER_USER_RESOURCES": "${workspaceFolder}/blender_vscode_development"
+    }
+}
