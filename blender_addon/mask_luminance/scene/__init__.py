@@ -1,14 +1,27 @@
-from .bake import BakeState, bake_generator, bake_step, finalize_bake, prepare_bake, run_bake
+from .bake import (
+    DEFAULT_PREVIEW_MAX_DIMENSION,
+    BakeState,
+    bake_generator,
+    bake_step,
+    clear_preview_cache,
+    finalize_bake,
+    prepare_bake,
+    run_bake,
+    run_preview,
+)
 from .images import image_to_rgb, result_image_name, rgb_to_image
 from .progress_overlay import MASKLUM_PG_BakeProgress, overlay_begin, overlay_end, overlay_update, progress_props
 
 __all__ = [
+    "DEFAULT_PREVIEW_MAX_DIMENSION",
     "BakeState",
     "bake_generator",
     "bake_step",
+    "clear_preview_cache",
     "finalize_bake",
     "prepare_bake",
     "run_bake",
+    "run_preview",
     "image_to_rgb",
     "result_image_name",
     "rgb_to_image",

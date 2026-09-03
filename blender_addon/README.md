@@ -101,6 +101,27 @@ breaks the legacy `bl_info` symlink/reload workflow).
   as a synchronous convenience wrapper for tests. Deliberately *not* a
   background `threading` worker — see `MASKLUM_OT_bake`'s docstring for why
   touching `bpy.data` off the main thread isn't an option in Blender.
+- **Done**: live proxy preview. `scene.bake.run_preview()` downsamples the
+  source (masks/diffuse/feature-preserve auto-resize to match, same as a
+  real bake) and runs the same pipeline at that resolution — benchmarked
+  ~6.6s at full 2048px vs ~120ms at 384px for a 3-channel setup. Every
+  visually-relevant property has an `update=` callback
+  (`operators._on_preview_relevant_change`) that schedules a recompute via a
+  `bpy.app.timers` debounce (~150ms, coalesces a slider drag into a steady
+  cadence rather than firing on every mouse-move). A "Live Preview" toggle,
+  resolution slider, and manual "Preview Now" button are in the panel.
+- **Done**: a preview-array cache (`scene.bake._cached_downsampled_rgb`).
+  Necessary, not optional — extracting a `bpy.types.Image`'s pixels costs
+  time proportional to its *native* resolution, and this repo's masks are
+  4096x4096, so the first (uncached) implementation took ~500-650ms per
+  recompute even at a 384px target, because it was re-reading and discarding
+  67M floats on every single tick. Caching the downsampled array (keyed by
+  image name + resolution + interpolation mode, invalidated whenever a
+  source/mask/diffuse/feature-preserve *pointer* changes) brings steady-state
+  recomputes down to ~60-100ms. Known gap: the cache can't detect a mask
+  being repainted/reloaded *in place* (same Image datablock, changed
+  pixels) — `MASKLUM_OT_clear_preview_cache` (the trash-can button next to
+  "Preview Now") is the manual escape hatch for that case.
 - **Not yet built**: an operator to add a mask straight from a file browser
   rather than requiring the user to already have it loaded as an Image
   datablock.

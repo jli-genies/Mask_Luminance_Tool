@@ -15,6 +15,15 @@ there's no lock to take, it's simply not supported. A modal operator gets
 UI responsiveness the supported way instead: each timer tick asks
 ``scene.bake`` for exactly one more step, applies it, then returns control to
 Blender's own event loop before the next tick.
+
+Live preview (``_on_preview_relevant_change`` wired up as every visually
+relevant property's ``update=`` callback) is a different mechanism again:
+``scene.bake.run_preview`` is cheap enough (benchmarked ~120ms at 384px vs.
+~6.6s at full 2048px resolution — see that function's docstring) to just run
+synchronously, so there's no modal operator or background thread involved —
+only a ``bpy.app.timers`` debounce (``_schedule_preview_update``) so a
+continuous slider drag doesn't try to recompute on every single mouse-move
+event, just at a steady ~150ms cadence.
 """
 
 from __future__ import annotations
@@ -33,7 +42,7 @@ from bpy.types import Operator, Panel, PropertyGroup, UIList
 
 from .core import blend as core_blend
 from .scene import bake as scene_bake
-from .scene.progress_overlay import MASKLUM_PG_BakeProgress, overlay_begin, overlay_end, overlay_update
+from .scene.progress_overlay import MASKLUM_PG_BakeProgress, overlay_begin, overlay_end, overlay_refresh, overlay_update
 
 GATE_MODE_ITEMS = (
     ("weight", "Weight", "Grayscale luminance/255 as a soft gate"),
@@ -47,6 +56,88 @@ DIFFUSE_MODE_ITEMS = (
     ("palette", "Palette", "Sample a flat skin color from a multiview/palette render"),
 )
 
+# How long to wait, after the *first* property change in a burst, before
+# actually recomputing the preview — not reset on each further change within
+# that window, so a continuous slider drag still gets refreshed at a steady
+# ~1-per-window cadence rather than only once at the very end. See
+# _schedule_preview_update for how bpy.app.timers.is_registered is used to
+# implement that without needing to track/cancel a pending timer by hand.
+PREVIEW_DEBOUNCE_SECONDS = 0.15
+
+
+def _channels_and_masks_ready_for_preview(settings):
+    """Builds (channels, mask_images) from settings, silently skipping anything incomplete.
+
+    Unlike MASKLUM_OT_bake's validation (which reports an error for an
+    enabled channel with no mask assigned), the live preview runs on every
+    property change, including transient mid-setup states like "just added a
+    channel, haven't picked its mask yet" — those channels are simply left
+    out of the preview rather than erroring or blocking it.
+    """
+    channels = []
+    mask_images = {}
+    for ch in settings.channels:
+        if not ch.enabled or ch.mask_image is None:
+            continue
+        channels.append(ch.to_mask_channel())
+        mask_images[ch.channel_name] = ch.mask_image
+    return channels, mask_images
+
+
+def _run_preview_now(settings) -> None:
+    """Synchronous proxy-resolution bake — see scene.bake.run_preview for the timing budget."""
+    channels, mask_images = _channels_and_masks_ready_for_preview(settings)
+    scene_bake.run_preview(
+        source=settings.source,
+        channels=channels,
+        mask_images=mask_images,
+        diffuse_mode=settings.diffuse_mode,
+        diffuse_image=settings.diffuse_image if settings.diffuse_mode != "self" else None,
+        feature_preserve_image=settings.feature_preserve_image or None,
+        luminance_only=settings.luminance_only,
+        self_locality_radius=settings.self_locality_radius,
+        max_dimension=settings.preview_max_dimension,
+    )
+
+
+def _run_preview_timer():
+    """The bpy.app.timers callback — reads current state at fire time, not when scheduled."""
+    try:
+        scene = bpy.context.scene
+        settings = getattr(scene, "mask_luminance", None) if scene is not None else None
+        if settings is None or not settings.live_preview or settings.source is None:
+            return None
+        _run_preview_now(settings)
+        overlay_refresh(bpy.context)
+    except Exception as exc:  # noqa: BLE001 - best-effort background convenience, never raise into Blender
+        print(f"[Mask Luminance] Live preview update failed: {exc}")
+    return None  # one-shot: don't ask Blender to call this again on its own
+
+
+def _schedule_preview_update():
+    if not bpy.app.timers.is_registered(_run_preview_timer):
+        bpy.app.timers.register(_run_preview_timer, first_interval=PREVIEW_DEBOUNCE_SECONDS)
+
+
+def _on_preview_relevant_change(self, context):
+    _schedule_preview_update()
+
+
+def _on_preview_relevant_pointer_change(self, context):
+    """Like _on_preview_relevant_change, but also drops cached preview arrays.
+
+    Used for every Image-pointer property (mask_image, source, diffuse_image,
+    feature_preserve_image): scene.bake._cached_downsampled_rgb is keyed by
+    Image *name*, so swapping which Image a field points at must invalidate
+    the cache — otherwise the preview would keep showing whatever was cached
+    under a name that may now mean something else entirely (or just be
+    stale). A full clear is simpler than tracking exactly which entries a
+    given swap could affect, and clearing is cheap (see
+    scene.bake.clear_preview_cache).
+    """
+    scene_bake.clear_preview_cache()
+    _schedule_preview_update()
+
 
 # =============================================================================
 # PROPERTY GROUPS
@@ -54,20 +145,34 @@ DIFFUSE_MODE_ITEMS = (
 class MASKLUM_PG_channel(PropertyGroup):
     """Mirrors core.blend.MaskChannel, minus mask_path (a live Image pointer instead)."""
 
+    # channel_name deliberately has no update= callback: it's a label with
+    # zero effect on the baked pixels, and live-updating it would otherwise
+    # fire a preview recompute on every keystroke while renaming a channel.
     channel_name: StringProperty(name="Name", default="channel")
-    mask_image: PointerProperty(name="Mask", type=bpy.types.Image)
-    enabled: BoolProperty(name="Enabled", default=True)
-    gate_mode: EnumProperty(name="Gate Mode", items=GATE_MODE_ITEMS, default="weight")
-    threshold: FloatProperty(name="Threshold", default=12.0, min=0.0, max=255.0)
-    radius: FloatProperty(name="Radius", default=8.0, min=0.0, max=512.0)
-    strength: FloatProperty(name="Strength", default=0.85, min=0.0, max=1.0)
-    diffuse_mix: FloatProperty(name="Diffuse Mix", default=0.0, min=0.0, max=1.0)
-    use_infill: BoolProperty(name="Use Infill", default=True)
-    spill_outside: BoolProperty(name="Spill Outside", default=False)
-    fill_holes: BoolProperty(name="Fill Holes", default=False)
-    region_tolerance: IntProperty(name="Region Tolerance", default=40, min=0, max=255)
-    blend_group: StringProperty(name="Blend Group", default="")
-    blend_weight: FloatProperty(name="Blend Weight", default=1.0, min=0.0)
+    mask_image: PointerProperty(name="Mask", type=bpy.types.Image, update=_on_preview_relevant_pointer_change)
+    enabled: BoolProperty(name="Enabled", default=True, update=_on_preview_relevant_change)
+    gate_mode: EnumProperty(name="Gate Mode", items=GATE_MODE_ITEMS, default="weight", update=_on_preview_relevant_change)
+    threshold: FloatProperty(name="Threshold", default=12.0, min=0.0, max=255.0, update=_on_preview_relevant_change)
+    radius: FloatProperty(name="Radius", default=8.0, min=0.0, max=512.0, update=_on_preview_relevant_change)
+    strength: FloatProperty(name="Strength", default=0.85, min=0.0, max=1.0, update=_on_preview_relevant_change)
+    diffuse_mix: FloatProperty(name="Diffuse Mix", default=0.0, min=0.0, max=1.0, update=_on_preview_relevant_change)
+    use_infill: BoolProperty(name="Use Infill", default=True, update=_on_preview_relevant_change)
+    spill_outside: BoolProperty(name="Spill Outside", default=False, update=_on_preview_relevant_change)
+    fill_holes: BoolProperty(name="Fill Holes", default=False, update=_on_preview_relevant_change)
+    region_tolerance: IntProperty(name="Region Tolerance", default=40, min=0, max=255, update=_on_preview_relevant_change)
+    blend_group: StringProperty(name="Blend Group", default="", update=_on_preview_relevant_change)
+    blend_weight: FloatProperty(name="Blend Weight", default=1.0, min=0.0, update=_on_preview_relevant_change)
+    flat_fill: BoolProperty(
+        name="Flat Fill",
+        description=(
+            "Fill the gated region with one flat mean skin color instead of infill/blur, "
+            "for an exact hand-painted mask (e.g. eyebrows/lips) rather than a soft automatic "
+            "gate. Radius only feathers outward past the painted edge; the interior always "
+            "stays fully covered. Always blends full RGB, ignoring 'Luminance Only'"
+        ),
+        default=False,
+        update=_on_preview_relevant_change,
+    )
 
     def to_mask_channel(self) -> core_blend.MaskChannel:
         """Builds the core.blend.MaskChannel this property group represents.
@@ -93,23 +198,49 @@ class MASKLUM_PG_channel(PropertyGroup):
             region_tolerance=self.region_tolerance,
             blend_group=self.blend_group or None,
             blend_weight=self.blend_weight,
+            flat_fill=self.flat_fill,
         )
 
 
 class MASKLUM_PG_settings(PropertyGroup):
     """Top-level addon state, stored on the Scene."""
 
-    source: PointerProperty(name="Source Texture", type=bpy.types.Image)
-    diffuse_mode: EnumProperty(name="Diffuse Mode", items=DIFFUSE_MODE_ITEMS, default="self")
-    diffuse_image: PointerProperty(name="Diffuse Image", type=bpy.types.Image)
-    feature_preserve_image: PointerProperty(name="Feature Preserve Mask", type=bpy.types.Image)
-    self_locality_radius: FloatProperty(
-        name="Self Locality Radius", default=core_blend.DEFAULT_SELF_LOCALITY_RADIUS, min=1.0, max=4096.0
+    source: PointerProperty(name="Source Texture", type=bpy.types.Image, update=_on_preview_relevant_pointer_change)
+    diffuse_mode: EnumProperty(
+        name="Diffuse Mode", items=DIFFUSE_MODE_ITEMS, default="self", update=_on_preview_relevant_change
     )
-    luminance_only: BoolProperty(name="Luminance Only", default=True)
+    diffuse_image: PointerProperty(
+        name="Diffuse Image", type=bpy.types.Image, update=_on_preview_relevant_pointer_change
+    )
+    feature_preserve_image: PointerProperty(
+        name="Feature Preserve Mask", type=bpy.types.Image, update=_on_preview_relevant_pointer_change
+    )
+    self_locality_radius: FloatProperty(
+        name="Self Locality Radius",
+        default=core_blend.DEFAULT_SELF_LOCALITY_RADIUS,
+        min=1.0,
+        max=4096.0,
+        update=_on_preview_relevant_change,
+    )
+    luminance_only: BoolProperty(name="Luminance Only", default=True, update=_on_preview_relevant_change)
 
     channels: CollectionProperty(type=MASKLUM_PG_channel)
     active_channel_index: IntProperty(default=0)
+
+    live_preview: BoolProperty(
+        name="Live Preview",
+        description="Recompute a small downsampled preview automatically as channel settings change",
+        default=True,
+        update=_on_preview_relevant_change,
+    )
+    preview_max_dimension: IntProperty(
+        name="Preview Resolution",
+        description="Longest side, in pixels, of the live preview texture",
+        default=scene_bake.DEFAULT_PREVIEW_MAX_DIMENSION,
+        min=64,
+        max=1024,
+        update=_on_preview_relevant_change,
+    )
 
 
 # =============================================================================
@@ -125,6 +256,9 @@ class MASKLUM_OT_channel_add(Operator):
         channel = settings.channels.add()
         channel.channel_name = f"channel_{len(settings.channels)}"
         settings.active_channel_index = len(settings.channels) - 1
+        # Collection add/remove/move don't fire a property update= callback
+        # the way a scalar field assignment does, so schedule explicitly.
+        _schedule_preview_update()
         return {"FINISHED"}
 
 
@@ -141,6 +275,7 @@ class MASKLUM_OT_channel_remove(Operator):
         settings = context.scene.mask_luminance
         settings.channels.remove(settings.active_channel_index)
         settings.active_channel_index = max(0, settings.active_channel_index - 1)
+        _schedule_preview_update()
         return {"FINISHED"}
 
 
@@ -162,6 +297,10 @@ class MASKLUM_OT_channel_move(Operator):
         if 0 <= target < len(settings.channels):
             settings.channels.move(index, target)
             settings.active_channel_index = target
+            # Channels apply sequentially, each correcting the previous
+            # one's output, so reordering changes the result even though no
+            # scalar value changed.
+            _schedule_preview_update()
         return {"FINISHED"}
 
 
@@ -270,6 +409,52 @@ class MASKLUM_OT_bake(Operator):
         return self.invoke(context, None)
 
 
+class MASKLUM_OT_preview_now(Operator):
+    """Runs the (fast, downsampled) preview immediately rather than waiting for the debounce.
+
+    Mainly useful with Live Preview turned off — a manual "show me roughly
+    what this looks like" without committing to a full-resolution bake.
+    """
+
+    bl_idname = "mask_luminance.preview_now"
+    bl_label = "Preview Now"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.mask_luminance.source is not None
+
+    def execute(self, context):
+        settings = context.scene.mask_luminance
+        try:
+            _run_preview_now(settings)
+        except (ValueError, KeyError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class MASKLUM_OT_clear_preview_cache(Operator):
+    """Escape hatch for the live preview's one known staleness gap.
+
+    scene.bake._cached_downsampled_rgb keys its cache on Image *name*, not
+    pixel content, so repainting or reloading a mask/source in place (same
+    Image datablock, changed pixels) won't be picked up automatically —
+    every pointer-property change already clears the cache on its own, this
+    is only needed for that one in-place-edit case.
+    """
+
+    bl_idname = "mask_luminance.clear_preview_cache"
+    bl_label = "Clear Preview Cache"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        scene_bake.clear_preview_cache()
+        _schedule_preview_update()
+        self.report({"INFO"}, "Preview cache cleared")
+        return {"FINISHED"}
+
+
 # =============================================================================
 # UI
 # =============================================================================
@@ -323,9 +508,11 @@ class MASKLUM_PT_main(Panel):
             box.prop(channel, "threshold")
             box.prop(channel, "radius")
             box.prop(channel, "strength")
-            box.prop(channel, "diffuse_mix")
-            box.prop(channel, "use_infill")
-            box.prop(channel, "spill_outside")
+            box.prop(channel, "flat_fill")
+            if not channel.flat_fill:
+                box.prop(channel, "diffuse_mix")
+                box.prop(channel, "use_infill")
+                box.prop(channel, "spill_outside")
             if channel.gate_mode == "weight":
                 box.prop(channel, "fill_holes")
             if channel.gate_mode == "color_id":
@@ -333,6 +520,16 @@ class MASKLUM_PT_main(Panel):
             box.prop(channel, "blend_group")
             if channel.blend_group:
                 box.prop(channel, "blend_weight")
+
+        layout.separator()
+        preview_row = layout.row(align=True)
+        preview_row.prop(settings, "live_preview", toggle=True, icon="HIDE_OFF")
+        preview_sub = preview_row.row(align=True)
+        preview_sub.enabled = settings.live_preview
+        preview_sub.prop(settings, "preview_max_dimension", text="Res")
+        preview_actions = layout.row(align=True)
+        preview_actions.operator("mask_luminance.preview_now", icon="FILE_REFRESH")
+        preview_actions.operator("mask_luminance.clear_preview_cache", icon="TRASH", text="")
 
         layout.separator()
         layout.operator("mask_luminance.bake", icon="RENDER_STILL")
@@ -346,6 +543,8 @@ CLASSES = [
     MASKLUM_OT_channel_remove,
     MASKLUM_OT_channel_move,
     MASKLUM_OT_bake,
+    MASKLUM_OT_preview_now,
+    MASKLUM_OT_clear_preview_cache,
     MASKLUM_UL_channels,
     MASKLUM_PT_main,
 ]

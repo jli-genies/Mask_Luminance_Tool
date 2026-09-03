@@ -11,6 +11,7 @@ two infill functions agree in isolation.
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
 import pytest
 
@@ -140,6 +141,124 @@ def test_process_matches_legacy_tool_no_feature_preserve(legacy_blend, repo_root
     ported_pixels = core_blend.load_rgb(str(ported_out))
 
     np.testing.assert_array_equal(ported_pixels, legacy_pixels)
+
+
+FLAT_FILL_CHANNEL_SPECS = [
+    dict(
+        name="eyebrow_lip",
+        mask_path="masks/eyebrow_lip_mask.png",
+        enabled=True,
+        gate_mode="blue_paint",
+        threshold=1.0,
+        radius=20.0,
+        strength=1.0,
+        flat_fill=True,
+    ),
+]
+
+
+def test_process_matches_legacy_tool_flat_fill(legacy_blend, repo_root, texture_path, tmp_path):
+    """flat_fill (and its outward-only feathering) must match the original tool too."""
+    specs = _resolve_mask_paths(repo_root, FLAT_FILL_CHANNEL_SPECS)
+
+    legacy_channels = [legacy_blend.MaskChannel(**s) for s in specs]
+    ported_channels = [core_blend.MaskChannel(**s) for s in specs]
+
+    legacy_out = tmp_path / "legacy.png"
+    ported_out = tmp_path / "ported.png"
+
+    # luminance_only=True (the default) on purpose: flat_fill must override it
+    # internally on both sides, so this also guards the chroma-leak fix.
+    legacy_blend.process(
+        texture_path=str(texture_path),
+        channels=legacy_channels,
+        out_texture_path=str(legacy_out),
+        diffuse_mode="self",
+    )
+    core_blend.process(
+        texture_path=str(texture_path),
+        channels=ported_channels,
+        out_texture_path=str(ported_out),
+        diffuse_mode="self",
+    )
+
+    legacy_pixels = core_blend.load_rgb(str(legacy_out))
+    ported_pixels = core_blend.load_rgb(str(ported_out))
+
+    np.testing.assert_array_equal(ported_pixels, legacy_pixels)
+
+
+def test_flat_fill_covers_interior_fully_regardless_of_radius(repo_root, texture_path):
+    """A flat_fill channel's painted interior must stay fully opaque at any radius.
+
+    Regression guard for the bug this feature was built to avoid:
+    apply_blending_radius's edge-straddling taper erodes a thin shape's whole
+    interior once radius exceeds its half-width. feather_mask_outward must not.
+    """
+    mask_path = repo_root / "masks" / "eyebrow_lip_mask.png"
+    if not mask_path.exists():
+        pytest.skip(f"Reference mask missing: {mask_path}")
+
+    sample = core_blend.load_rgb(str(texture_path))
+    mask_img = core_blend.resize_to(core_blend.load_rgb(str(mask_path)), sample.shape[:2], nearest=True)
+    gate = core_blend.extract_blue_paint_mask(mask_img) > 0
+    assert gate.any(), "eyebrow_lip_mask.png produced an empty gate at this texture's resolution"
+
+    dist = cv2.distanceTransform(gate.astype(np.uint8), cv2.DIST_L2, 5)
+    cy, cx = np.unravel_index(np.argmax(dist), dist.shape)
+    half_width = float(dist[cy, cx])
+
+    expected_target = core_blend.build_local_diffuse_target(
+        sample, gate.astype(np.float32), core_blend.DEFAULT_SELF_LOCALITY_RADIUS, flat=True
+    )[cy, cx]
+
+    mask_imgs = {"eyebrow_lip": mask_img}
+    for radius in (6.0, half_width * 3.0):
+        ch = core_blend.MaskChannel(
+            name="eyebrow_lip", mask_path="masks/eyebrow_lip_mask.png", enabled=True,
+            gate_mode="blue_paint", threshold=1.0, radius=radius, strength=1.0, flat_fill=True,
+        )
+        working, _ = core_blend.process_arrays(sample, [ch], mask_imgs, diffuse_mode="self")
+        # Full RGB, full strength, deep interior: must land on the flat
+        # self-fill target almost exactly, at every radius.
+        assert np.abs(working[cy, cx].astype(np.float32) - expected_target).max() < 5
+
+
+def test_flat_fill_covers_dark_painted_content_not_just_bright(repo_root, texture_path):
+    """flat_fill must cover legitimately dark painted pixels (e.g. an inner lip
+    line, near-black brow hairs) at small radius, not just bright ones.
+
+    Regression guard: luminance_delta_mask's "sample luminance < 8 == empty UV
+    gutter" background check can't tell that dark content apart from real
+    background and used to zero it out completely — the darkest, most visible
+    part of the painted feature would silently stay uncorrected, needing an
+    unreasonably large radius before feather_mask_outward's outward bleed
+    happened to bridge across it from nearby brighter gated pixels.
+    """
+    mask_path = repo_root / "masks" / "eyebrow_lip_mask.png"
+    if not mask_path.exists():
+        pytest.skip(f"Reference mask missing: {mask_path}")
+
+    sample = core_blend.load_rgb(str(texture_path))
+    mask_img = core_blend.resize_to(core_blend.load_rgb(str(mask_path)), sample.shape[:2], nearest=True)
+    gate = core_blend.extract_blue_paint_mask(mask_img) > 0
+
+    dark_in_gate = gate & (core_blend.luminance(sample) < 8.0)
+    if not dark_in_gate.any():
+        pytest.skip("This texture/mask pairing has no near-black painted pixels to test against.")
+    ys, xs = np.where(dark_in_gate)
+    dy, dx = int(ys[len(ys) // 2]), int(xs[len(ys) // 2])
+
+    expected_target = core_blend.build_local_diffuse_target(
+        sample, gate.astype(np.float32), core_blend.DEFAULT_SELF_LOCALITY_RADIUS, flat=True
+    )[dy, dx]
+
+    ch = core_blend.MaskChannel(
+        name="eyebrow_lip", mask_path="masks/eyebrow_lip_mask.png", enabled=True,
+        gate_mode="blue_paint", threshold=12.0, radius=2.0, strength=1.0, flat_fill=True,
+    )
+    working, _ = core_blend.process_arrays(sample, [ch], {"eyebrow_lip": mask_img}, diffuse_mode="self")
+    assert np.abs(working[dy, dx].astype(np.float32) - expected_target).max() < 5
 
 
 def test_process_arrays_matches_process_file_path_entry_point(repo_root, texture_path, feature_preserve_path, tmp_path):

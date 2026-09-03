@@ -98,6 +98,26 @@ class MaskChannel:
         blend_weight: Relative contribution of this channel within its
             ``blend_group`` when two channels' coverage overlaps. Ignored
             for channels with no blend_group.
+        flat_fill: Instead of infill/blur (and instead of ``diffuse_mix``),
+            fill the entire gated region with one flat color: the mean of
+            the sample's own clean skin pixels (the same "outside every
+            enabled channel's gate and the feature-preserve mask" set used
+            to build the self-mode diffuse target). Meant for an exact,
+            hand-painted mask rather than a soft automatic gate, so the
+            gated region is always fully covered regardless of ``radius`` —
+            feathering only bleeds *outward* past the painted edge (see
+            ``feather_mask_outward``), it never fades the interior the way
+            ``apply_blending_radius`` would for a shape thinner than
+            ``radius``. ``use_infill``, ``diffuse_mix`` and
+            ``spill_outside`` are ignored when this is set. Also always
+            blends in full RGB regardless of the global ``luminance_only``
+            setting, for the same reason: a flat fill needs to replace hue,
+            not just brightness. That per-channel override only applies to
+            a standalone channel — inside a ``blend_group`` the whole
+            group still blends under one shared ``luminance_only`` (see
+            ``composite_correction_targets``), so avoid pairing a
+            ``flat_fill`` channel with others in the same group unless
+            ``luminance_only`` is already off for the whole run.
     """
 
     name: str
@@ -115,6 +135,7 @@ class MaskChannel:
     region_tolerance: int = 40
     blend_group: Optional[str] = None
     blend_weight: float = 1.0
+    flat_fill: bool = False
 
     def __post_init__(self) -> None:
         if self.gate_mode not in GATE_MODES:
@@ -291,19 +312,29 @@ def build_local_diffuse_target(
     exclude_gate: np.ndarray,
     radius: float,
     bg_threshold: float = 8.0,
+    flat: bool = False,
 ) -> np.ndarray:
-    """Reconstructs a spatially-varying diffuse target from the sample's own "clean" pixels.
+    """Reconstructs a diffuse target from the sample's own "clean" pixels.
 
     ``exclude_gate`` is the union of every enabled channel's gate plus the
     feature-preserve mask — whatever has already been flagged as needing
-    correction or as non-skin (eyes/mouth). Rather than averaging the
-    remaining pixels into one flat RGB, this heavily blurs them into a
-    smooth low-frequency reconstruction that still varies across the face
-    (forehead curvature, falloff toward the temples, etc.). A single flat
-    color correcting a broad area produces a visible seam no matter how well
-    its spatial edge is feathered, because the flat patch and the naturally-
-    shaded skin around it are different *shapes* of color, not just
-    different colors — this keeps the correction following the same shape.
+    correction or as non-skin (eyes/mouth). By default (``flat=False``),
+    rather than averaging the remaining pixels into one flat RGB, this
+    heavily blurs them into a smooth low-frequency reconstruction that still
+    varies across the face (forehead curvature, falloff toward the temples,
+    etc.). A single flat color correcting a broad area produces a visible
+    seam no matter how well its spatial edge is feathered, because the flat
+    patch and the naturally-shaded skin around it are different *shapes* of
+    color, not just different colors — this keeps the correction following
+    the same shape.
+
+    ``flat=True`` skips that and returns the plain mean of the clean pixels,
+    broadcast to full size — for callers (``flat_fill`` channels) that
+    explicitly want one uniform fill color rather than a shape-following
+    reconstruction, e.g. a small feature (eyebrows/lips) where there isn't
+    enough local shading gradient around it for "follow the shape" to mean
+    anything, and a flat swatch reads more like intentional coverage than a
+    blur artifact.
 
     A blur this wide is expensive at full texture resolution and pointless
     too, since only low-frequency content is wanted here anyway — so the
@@ -317,6 +348,15 @@ def build_local_diffuse_target(
             "outside the enabled channel masks / feature-preserve mask. "
             "Loosen those masks or use diffuse_mode='uv'/'palette' instead."
         )
+
+    if flat:
+        mean = sample.astype(np.float32)[valid].mean(axis=0)
+        logger.info(
+            "Flat self-fill target: mean skin RGB ≈ (%.1f, %.1f, %.1f) from %d clean px",
+            mean[0], mean[1], mean[2], int(valid.sum()),
+        )
+        return np.broadcast_to(mean, sample.shape).astype(np.float32).copy()
+
     weight = valid.astype(np.float32)
     logger.info(
         "Self-mode diffuse target: reconstructed from %d clean px (%.1f%% of frame), locality radius=%.0fpx",
@@ -473,6 +513,39 @@ def apply_blending_radius(
     return np.clip(extended * envelope, 0.0, 1.0).astype(np.float32)
 
 
+def feather_mask_outward(mask: np.ndarray, radius: float) -> np.ndarray:
+    """Feathers ``mask`` outward only, never eroding its own interior.
+
+    ``apply_blending_radius`` tapers a band *straddling* the mask's edge, so
+    it only reaches full strength ``radius`` px inside the boundary — fine
+    for broad, already-soft automatic gates (shadow/highlight regions), but
+    wrong for an exact, hand-painted silhouette (e.g. an eyebrow/lip mask):
+    once ``radius`` exceeds roughly half the shape's own width, the taper
+    band swallows the whole interior and no pixel ever reaches full
+    strength, which reads as the mask getting *more* transparent the larger
+    ``radius`` is set — backwards from what "blend the edge into the base
+    texture" should mean for a shape that's already exactly right.
+
+    This instead leaves every pixel inside ``mask``'s own footprint
+    untouched (full author-intended strength, however thin the shape), and
+    only fades from that value down to 0 over a ``radius``-px band *outside*
+    the footprint. A larger radius then only widens how far the fill bleeds
+    past the painted line into the surrounding texture; it can't weaken
+    coverage of what was actually painted.
+    """
+    if radius <= 0:
+        return mask.astype(np.float32)
+    footprint = mask > 1e-3
+    if not np.any(footprint):
+        return mask.astype(np.float32)
+
+    dist_out = cv2.distanceTransform((~footprint).astype(np.uint8), cv2.DIST_L2, 5)
+    t = np.clip(1.0 - dist_out / radius, 0.0, 1.0)
+    envelope = (t * t * (3.0 - 2.0 * t)).astype(np.float32)  # smoothstep, 1 inside footprint
+
+    return np.clip(np.maximum(mask.astype(np.float32), envelope), 0.0, 1.0).astype(np.float32)
+
+
 def masked_gaussian_blur(
     rgb: np.ndarray,
     weight_mask: np.ndarray,
@@ -587,6 +660,33 @@ def compute_channel_soft_mask(
     if feature_preserve is not None:
         gate = gate * (1.0 - np.clip(feature_preserve, 0.0, 1.0))
 
+    if channel.flat_fill:
+        # An exact, hand-painted footprint: never erode it, only bleed
+        # outward past it — see feather_mask_outward(). Still gated by the
+        # luminance-delta threshold below (so a leaky/broad gate — e.g. a
+        # "weight" gate misapplied to a mostly-black mask image — needs an
+        # actual difference from the diffuse target to activate, not just
+        # any nonzero gate weight), but NOT via the shared
+        # ``luminance_delta_mask``: its "sample luminance < 8 == empty UV
+        # gutter" rule can't distinguish that from legitimately very dark
+        # painted content (an inner lip line, near-black brow hairs) —
+        # exactly what flat_fill exists to cover — and zeroed it out
+        # completely, leaving the darkest, most visible part of the painted
+        # feature uncovered. That background check is reproduced here but
+        # applied only *outside* the gate, where it's protecting real
+        # background from the outward bleed rather than erasing intended
+        # coverage.
+        d_l = np.abs(luminance(working) - luminance(diffuse_target))
+        over = np.maximum(d_l - channel.threshold, 0.0)
+        ramp = channel.threshold if channel.threshold > 1e-6 else 1.0
+        raw = np.clip(over / ramp, 0.0, 1.0).astype(np.float32) * gate.astype(np.float32)
+        outside_gate_bg = (gate <= 1e-3) & (luminance(working) < 8.0)
+        raw = raw * (~outside_gate_bg).astype(np.float32)
+
+        soft = feather_mask_outward(raw, channel.radius)
+        soft = soft * (~outside_gate_bg).astype(np.float32)
+        return soft
+
     raw = luminance_delta_mask(working, diffuse_target, channel.threshold, gate)
     soft = apply_blending_radius(raw, channel.radius, spill_outside=channel.spill_outside)
     if channel.spill_outside:
@@ -605,21 +705,30 @@ def apply_mask_channel(
     palette: Dict[str, Tuple[int, int, int]],
     luminance_only: bool = True,
     feature_preserve: Optional[np.ndarray] = None,
+    flat_target: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Runs one mask channel's full pass: gate -> threshold -> feather -> correct.
+
+    ``flat_target`` (required if ``channel.flat_fill``) overrides both the
+    threshold-gating reference and the fill color with one flat mean-skin
+    color — see ``MaskChannel.flat_fill``.
 
     Returns the updated working texture and the channel's soft weight mask
     (post-feather, pre-strength — useful for debug output).
     """
-    soft = compute_channel_soft_mask(working, diffuse_target, mask_img, channel, palette, feature_preserve)
+    target = flat_target if (channel.flat_fill and flat_target is not None) else diffuse_target
+    diffuse_mix = 1.0 if channel.flat_fill else channel.diffuse_mix
+    effective_luminance_only = False if channel.flat_fill else luminance_only
+
+    soft = compute_channel_soft_mask(working, target, mask_img, channel, palette, feature_preserve)
     new_working = correct_region(
         working,
         soft,
         channel.radius,
         channel.strength,
-        diffuse_target=diffuse_target if channel.diffuse_mix > 0.0 else None,
-        diffuse_mix=channel.diffuse_mix,
-        luminance_only=luminance_only,
+        diffuse_target=target if diffuse_mix > 0.0 else None,
+        diffuse_mix=diffuse_mix,
+        luminance_only=effective_luminance_only,
         use_infill=channel.use_infill,
     )
     return new_working, soft
@@ -667,6 +776,7 @@ def apply_blend_group(
     palette: Dict[str, Tuple[int, int, int]],
     luminance_only: bool = True,
     feature_preserve: Optional[np.ndarray] = None,
+    flat_target: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """Blends several channels' independent corrections into one result.
 
@@ -684,14 +794,17 @@ def apply_blend_group(
     soft_masks: Dict[str, np.ndarray] = {}
 
     for ch in group_channels:
-        soft = compute_channel_soft_mask(working, diffuse_target, mask_imgs[ch.name], ch, palette, feature_preserve)
+        ch_target = flat_target if (ch.flat_fill and flat_target is not None) else diffuse_target
+        ch_diffuse_mix = 1.0 if ch.flat_fill else ch.diffuse_mix
+
+        soft = compute_channel_soft_mask(working, ch_target, mask_imgs[ch.name], ch, palette, feature_preserve)
         soft_masks[ch.name] = soft
         target = build_correction_target(
             working,
             soft,
             ch.radius,
-            diffuse_target=diffuse_target if ch.diffuse_mix > 0.0 else None,
-            diffuse_mix=ch.diffuse_mix,
+            diffuse_target=ch_target if ch_diffuse_mix > 0.0 else None,
+            diffuse_mix=ch_diffuse_mix,
             use_infill=ch.use_infill,
         )
         targets.append(target)
@@ -744,6 +857,7 @@ def run_channel_pipeline(
     palette: Dict[str, Tuple[int, int, int]],
     luminance_only: bool = True,
     feature_preserve: Optional[np.ndarray] = None,
+    flat_target: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """Runs every enabled channel over ``working``, in order.
 
@@ -751,8 +865,9 @@ def run_channel_pipeline(
     correcting the previous one's output. Channels sharing a ``blend_group``
     name are instead run together through ``apply_blend_group`` the first
     time any of them is reached, so their results blend by coverage instead
-    of overwriting each other. Returns the final texture and each channel's
-    soft mask (for debug output).
+    of overwriting each other. ``flat_target`` (see ``MaskChannel.flat_fill``)
+    is only used by channels that opt into it. Returns the final texture and
+    each channel's soft mask (for debug output).
     """
     working = working.copy()
     channel_masks: Dict[str, np.ndarray] = {}
@@ -761,6 +876,7 @@ def run_channel_pipeline(
         if isinstance(item, list):
             working, group_soft = apply_blend_group(
                 working, diffuse_target, mask_imgs, item, palette, luminance_only, feature_preserve,
+                flat_target,
             )
             channel_masks.update(group_soft)
             logger.info(
@@ -770,13 +886,14 @@ def run_channel_pipeline(
             ch = item
             working, soft = apply_mask_channel(
                 working, diffuse_target, mask_imgs[ch.name], ch, palette, luminance_only, feature_preserve,
+                flat_target,
             )
             channel_masks[ch.name] = soft
             logger.info(
                 "Applied channel '%s' (gate=%s, threshold=%.1f, radius=%.1f, strength=%.2f, "
-                "diffuse_mix=%.0f%%, infill=%s, active px=%.1f%%)",
+                "diffuse_mix=%.0f%%, infill=%s, flat_fill=%s, active px=%.1f%%)",
                 ch.name, ch.gate_mode, ch.threshold, ch.radius, ch.strength,
-                100.0 * ch.diffuse_mix, ch.use_infill, 100.0 * float((soft > 0.01).mean()),
+                100.0 * ch.diffuse_mix, ch.use_infill, ch.flat_fill, 100.0 * float((soft > 0.01).mean()),
             )
 
     return working, channel_masks
@@ -809,19 +926,26 @@ def process_arrays(
     if feature_preserve_img is not None:
         feature_preserve = composite_weights(feature_preserve_img)
 
+    exclude = np.zeros(sample.shape[:2], dtype=np.float32)
+    for ch in active:
+        exclude = np.maximum(exclude, compute_channel_gate(mask_imgs[ch.name], ch, palette))
+    if feature_preserve is not None:
+        exclude = np.maximum(exclude, feature_preserve)
+
     if diffuse_mode == "self":
-        exclude = np.zeros(sample.shape[:2], dtype=np.float32)
-        for ch in active:
-            exclude = np.maximum(exclude, compute_channel_gate(mask_imgs[ch.name], ch, palette))
-        if feature_preserve is not None:
-            exclude = np.maximum(exclude, feature_preserve)
         diffuse_target = build_local_diffuse_target(sample, exclude, self_locality_radius)
     else:
         if diffuse_img is None:
             raise ValueError("diffuse_img is required unless diffuse_mode='self'.")
         diffuse_target = make_diffuse_target(sample, diffuse_img, diffuse_mode)
 
-    return run_channel_pipeline(sample, diffuse_target, mask_imgs, active, palette, luminance_only, feature_preserve)
+    flat_target = None
+    if any(ch.flat_fill for ch in active):
+        flat_target = build_local_diffuse_target(sample, exclude, self_locality_radius, flat=True)
+
+    return run_channel_pipeline(
+        sample, diffuse_target, mask_imgs, active, palette, luminance_only, feature_preserve, flat_target,
+    )
 
 
 def process(

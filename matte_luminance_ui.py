@@ -336,6 +336,9 @@ class ChannelPanel(QGroupBox):
         form.addRow(self.use_infill)
         form.addRow(self.spill_outside)
 
+        self.flat_fill = QCheckBox("Flat fill (mean skin color instead of infill/blur)")
+        form.addRow(self.flat_fill)
+
         self.blend_group = QLineEdit()
         self.blend_group.setPlaceholderText("optional — e.g. skin_uniform")
         form.addRow("Blend group", self.blend_group)
@@ -349,18 +352,30 @@ class ChannelPanel(QGroupBox):
         self.gate_mode.currentTextChanged.connect(self._on_gate_mode_changed)
         for w in (self.threshold, self.radius, self.strength, self.diffuse_mix, self.region_tolerance, self.blend_weight):
             w.valueChanged.connect(lambda *_: self.changed.emit())
-        for cb in (self.use_infill, self.spill_outside, self.fill_holes, *self.region_checks.values()):
+        for cb in (self.use_infill, self.spill_outside, self.fill_holes, self.flat_fill, *self.region_checks.values()):
             cb.toggled.connect(lambda *_: self.changed.emit())
+        self.flat_fill.toggled.connect(self._on_flat_fill_toggled)
         self.mask_edit.editingFinished.connect(self.changed.emit)
         self.blend_group.editingFinished.connect(self.changed.emit)
         self.toggled.connect(lambda *_: self.changed.emit())
 
         self._on_gate_mode_changed(self.gate_mode.currentText())
+        self._on_flat_fill_toggled(self.flat_fill.isChecked())
 
     def _on_gate_mode_changed(self, mode: str) -> None:
         self.fill_holes.setVisible(mode == "weight")
         self.region_row.setVisible(mode == "color_id")
         self.region_tolerance.setVisible(mode == "color_id")
+        self.changed.emit()
+
+    def _on_flat_fill_toggled(self, on: bool) -> None:
+        # All three are ignored by MaskChannel.flat_fill — the flat
+        # mean-color target always fully replaces the pixel (same as
+        # diffuse_mix=1), and feathering is always outward-only regardless
+        # of spill_outside — see feather_mask_outward().
+        self.diffuse_mix.setVisible(not on)
+        self.use_infill.setVisible(not on)
+        self.spill_outside.setVisible(not on)
         self.changed.emit()
 
     def _browse(self) -> None:
@@ -396,6 +411,7 @@ class ChannelPanel(QGroupBox):
             region_tolerance=int(self.region_tolerance.value()),
             blend_group=self.blend_group.text().strip() or None,
             blend_weight=self.blend_weight.value(),
+            flat_fill=self.flat_fill.isChecked(),
         )
 
 
