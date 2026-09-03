@@ -313,6 +313,50 @@ def make_diffuse_target(
     raise ValueError(f"Unknown diffuse mode: {mode}")
 
 
+def estimate_diffuse_color(
+    sample: np.ndarray,
+    exclude_gate: np.ndarray,
+    bg_threshold: float = 8.0,
+) -> np.ndarray:
+    """Mean RGB (float32, shape (3,)) of the sample's clean pixels outside ``exclude_gate``.
+
+    This is the flat color ``build_local_diffuse_target(..., flat=True)``
+    broadcasts across the frame, and the value ``flat_fill`` channels and
+    ``--diffuse-mode self`` are centered on — surfaced as its own function so
+    UI layers can show/let the user override it without re-deriving the same
+    "clean pixel" selection logic.
+    """
+    lum = luminance(sample)
+    valid = (lum > bg_threshold) & (exclude_gate <= 0.5)
+    if not np.any(valid):
+        raise ValueError(
+            "Could not estimate a diffuse color: nothing left outside the "
+            "enabled channel masks / feature-preserve mask. Loosen those "
+            "masks or use --diffuse-mode uv/palette instead."
+        )
+    return sample.astype(np.float32)[valid].mean(axis=0)
+
+
+def resolve_diffuse_color(
+    sample: np.ndarray,
+    diffuse_mode: str,
+    exclude_gate: np.ndarray,
+    diffuse_img: Optional[np.ndarray] = None,
+) -> Optional[np.ndarray]:
+    """The single flat RGB a UI would show/let the user override for this setup.
+
+    ``self`` and ``palette`` modes are naturally described by one flat color
+    (the mean clean-skin pixel, or the palette's sampled skin color). ``uv``
+    mode's diffuse target is inherently a full per-pixel image, so there is
+    no one color to show and this returns ``None``.
+    """
+    if diffuse_mode == "self":
+        return estimate_diffuse_color(sample, exclude_gate)
+    if diffuse_mode == "palette" and diffuse_img is not None:
+        return sample_palette_skin_rgb(diffuse_img)
+    return None
+
+
 def build_local_diffuse_target(
     sample: np.ndarray,
     exclude_gate: np.ndarray,
@@ -334,18 +378,25 @@ def build_local_diffuse_target(
     color, not just different colors — this keeps the correction following
     the same shape.
 
-    ``flat=True`` skips that and returns the plain mean of the clean pixels,
-    broadcast to full size — for callers (``flat_fill`` channels) that
-    explicitly want one uniform fill color rather than a shape-following
-    reconstruction, e.g. a small feature (eyebrows/lips) where there isn't
-    enough local shading gradient around it for "follow the shape" to mean
-    anything, and a flat swatch reads more like intentional coverage than a
-    blur artifact.
+    ``flat=True`` skips that and returns ``estimate_diffuse_color``'s plain
+    mean of the clean pixels, broadcast to full size — for callers
+    (``flat_fill`` channels) that explicitly want one uniform fill color
+    rather than a shape-following reconstruction, e.g. a small feature
+    (eyebrows/lips) where there isn't enough local shading gradient around it
+    for "follow the shape" to mean anything, and a flat swatch reads more
+    like intentional coverage than a blur artifact.
 
     A blur this wide is expensive at full texture resolution and pointless
     too, since only low-frequency content is wanted here anyway — so the
     blur runs on a downsampled copy and is upsampled back afterward.
     """
+    if flat:
+        mean = estimate_diffuse_color(sample, exclude_gate, bg_threshold)
+        logger.info(
+            "Flat self-fill target: mean skin RGB ≈ (%.1f, %.1f, %.1f)", mean[0], mean[1], mean[2],
+        )
+        return np.broadcast_to(mean, sample.shape).astype(np.float32).copy()
+
     lum = luminance(sample)
     valid = (lum > bg_threshold) & (exclude_gate <= 0.5)
     if not np.any(valid):
@@ -354,14 +405,6 @@ def build_local_diffuse_target(
             "outside the enabled channel masks / feature-preserve mask. "
             "Loosen those masks or use --diffuse-mode uv/palette instead."
         )
-
-    if flat:
-        mean = sample.astype(np.float32)[valid].mean(axis=0)
-        logger.info(
-            "Flat self-fill target: mean skin RGB ≈ (%.1f, %.1f, %.1f) from %d clean px",
-            mean[0], mean[1], mean[2], int(valid.sum()),
-        )
-        return np.broadcast_to(mean, sample.shape).astype(np.float32).copy()
 
     weight = valid.astype(np.float32)
     logger.info(
@@ -895,6 +938,7 @@ def process(
     feature_preserve_path: Optional[str] = None,
     out_masks_dir: Optional[str] = None,
     self_locality_radius: float = DEFAULT_SELF_LOCALITY_RADIUS,
+    diffuse_color_override: Optional[Sequence[float]] = None,
 ) -> Dict[str, str]:
     """Runs every enabled mask channel in order over ``texture_path``.
 
@@ -904,6 +948,11 @@ def process(
     outside every enabled channel's gate and outside the feature-preserve
     mask, so broad corrections still follow the surrounding shading gradient
     instead of flattening to one constant color.
+
+    ``diffuse_color_override``, if given, replaces the diffuse target (and,
+    for ``flat_fill`` channels, the flat fill color too) with this flat RGB
+    everywhere, bypassing ``diffuse_mode`` entirely — for a user who wants to
+    hand-pick the diffuse color instead of trusting the auto-detected one.
     """
     sample = load_rgb(texture_path)
     palette = region_palette or DEFAULT_REGION_PALETTE
@@ -926,7 +975,12 @@ def process(
     if feature_preserve is not None:
         exclude = np.maximum(exclude, feature_preserve)
 
-    if diffuse_mode == "self":
+    diffuse_img = None
+    if diffuse_color_override is not None:
+        diffuse_target = np.broadcast_to(
+            np.asarray(diffuse_color_override, dtype=np.float32), sample.shape
+        ).copy()
+    elif diffuse_mode == "self":
         diffuse_target = build_local_diffuse_target(sample, exclude, self_locality_radius)
     else:
         if not diffuse_path:
@@ -936,13 +990,23 @@ def process(
 
     flat_target = None
     if any(ch.flat_fill for ch in active):
-        flat_target = build_local_diffuse_target(sample, exclude, self_locality_radius, flat=True)
+        if diffuse_color_override is not None:
+            flat_target = diffuse_target
+        else:
+            flat_target = build_local_diffuse_target(sample, exclude, self_locality_radius, flat=True)
 
     working, channel_masks = run_channel_pipeline(
         sample, diffuse_target, mask_imgs, active, palette, luminance_only, feature_preserve, flat_target,
     )
 
     results: Dict[str, str] = {}
+    resolved_color = (
+        np.asarray(diffuse_color_override, dtype=np.float32)
+        if diffuse_color_override is not None
+        else resolve_diffuse_color(sample, diffuse_mode, exclude, diffuse_img)
+    )
+    if resolved_color is not None:
+        results["diffuse_color"] = f"{resolved_color[0]:.1f},{resolved_color[1]:.1f},{resolved_color[2]:.1f}"
     if out_masks_dir:
         for name, soft in channel_masks.items():
             path = os.path.join(out_masks_dir, f"{name}_mask.png")
@@ -1013,6 +1077,15 @@ def main(argv: Optional[List[str]] = None) -> None:
         action="store_true",
         help="Blend full RGB instead of luminance-only (chroma may shift).",
     )
+    parser.add_argument(
+        "--diffuse-color",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("R", "G", "B"),
+        help="Override the auto-detected/sampled diffuse color (0-255 each) instead of "
+             "using --diffuse-mode's computed value.",
+    )
     parser.add_argument("--out-texture", default=None, help="Optional corrected albedo path.")
     parser.add_argument(
         "--out-masks-dir",
@@ -1051,6 +1124,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         feature_preserve_path=args.feature_preserve_mask,
         out_masks_dir=args.out_masks_dir,
         self_locality_radius=args.self_locality_radius,
+        diffuse_color_override=args.diffuse_color,
     )
 
 

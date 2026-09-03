@@ -28,12 +28,15 @@ event, just at a steady ~150ms cadence.
 
 from __future__ import annotations
 
+from typing import Optional, Tuple
+
 import bpy
 from bpy.props import (
     BoolProperty,
     CollectionProperty,
     EnumProperty,
     FloatProperty,
+    FloatVectorProperty,
     IntProperty,
     PointerProperty,
     StringProperty,
@@ -84,10 +87,24 @@ def _channels_and_masks_ready_for_preview(settings):
     return channels, mask_images
 
 
+def _diffuse_color_override_255(settings) -> Optional[Tuple[float, float, float]]:
+    """``settings.diffuse_color_override`` (0-1) as 0-255 RGB, or None if not enabled."""
+    if not settings.diffuse_color_override_enabled:
+        return None
+    return tuple(c * 255.0 for c in settings.diffuse_color_override)
+
+
+def _store_computed_diffuse_color(settings, diffuse_color) -> None:
+    """Mirrors a resolved 0-255 flat diffuse color into the read-only display swatch."""
+    if diffuse_color is None:
+        return
+    settings.diffuse_color_computed = tuple(float(c) / 255.0 for c in diffuse_color)
+
+
 def _run_preview_now(settings) -> None:
     """Synchronous proxy-resolution bake — see scene.bake.run_preview for the timing budget."""
     channels, mask_images = _channels_and_masks_ready_for_preview(settings)
-    scene_bake.run_preview(
+    _, diffuse_color = scene_bake.run_preview_with_color(
         source=settings.source,
         channels=channels,
         mask_images=mask_images,
@@ -97,7 +114,9 @@ def _run_preview_now(settings) -> None:
         luminance_only=settings.luminance_only,
         self_locality_radius=settings.self_locality_radius,
         max_dimension=settings.preview_max_dimension,
+        diffuse_color_override=_diffuse_color_override_255(settings),
     )
+    _store_computed_diffuse_color(settings, diffuse_color)
 
 
 def _run_preview_timer():
@@ -223,6 +242,34 @@ class MASKLUM_PG_settings(PropertyGroup):
         update=_on_preview_relevant_change,
     )
     luminance_only: BoolProperty(name="Luminance Only", default=True, update=_on_preview_relevant_change)
+
+    diffuse_color_computed: FloatVectorProperty(
+        name="Diffuse Color (Computed)",
+        description="The flat diffuse color auto-detected from the current diffuse mode/inputs "
+                    "('UV Map' mode has no single color, so this stays at its last value)",
+        subtype="COLOR",
+        size=3,
+        min=0.0,
+        max=1.0,
+        default=(0.5, 0.5, 0.5),
+    )
+    diffuse_color_override_enabled: BoolProperty(
+        name="Override Diffuse Color",
+        description="Use a hand-picked flat diffuse color instead of the auto-detected/sampled one",
+        default=False,
+        update=_on_preview_relevant_change,
+    )
+    diffuse_color_override: FloatVectorProperty(
+        name="Diffuse Color",
+        description="Flat diffuse color used everywhere the diffuse target is compared against or "
+                    "blended toward, in place of the auto-detected/sampled value",
+        subtype="COLOR",
+        size=3,
+        min=0.0,
+        max=1.0,
+        default=(0.72, 0.55, 0.45),
+        update=_on_preview_relevant_change,
+    )
 
     channels: CollectionProperty(type=MASKLUM_PG_channel)
     active_channel_index: IntProperty(default=0)
@@ -351,10 +398,13 @@ class MASKLUM_OT_bake(Operator):
                 feature_preserve_image=settings.feature_preserve_image or None,
                 luminance_only=settings.luminance_only,
                 self_locality_radius=settings.self_locality_radius,
+                diffuse_color_override=_diffuse_color_override_255(settings),
             )
         except (ValueError, KeyError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+
+        _store_computed_diffuse_color(settings, self._state.diffuse_color)
 
         if self._state.total_steps == 0:
             return self._finish(context)
@@ -485,6 +535,16 @@ class MASKLUM_PT_main(Panel):
             layout.prop(settings, "self_locality_radius")
         layout.prop(settings, "feature_preserve_image")
         layout.prop(settings, "luminance_only")
+
+        layout.separator()
+        diffuse_color_box = layout.box()
+        diffuse_color_box.label(text="Diffuse Color")
+        computed_row = diffuse_color_box.row()
+        computed_row.enabled = False
+        computed_row.prop(settings, "diffuse_color_computed", text="Computed")
+        diffuse_color_box.prop(settings, "diffuse_color_override_enabled")
+        if settings.diffuse_color_override_enabled:
+            diffuse_color_box.prop(settings, "diffuse_color_override", text="")
 
         layout.separator()
         layout.label(text="Mask Channels")

@@ -95,6 +95,30 @@ def test_channel_add_remove_move(scene_settings):
     assert scene_settings.channels[0].channel_name == "first"
 
 
+def test_flat_fill_available_regardless_of_gate_mode(scene_settings):
+    """flat_fill must stay a usable property no matter which Gate Mode is selected.
+
+    Regression guard for a report that the "Flat Fill" checkbox vanished
+    specifically under gate_mode="blue_paint" in a live Blender session — the
+    panel draw code has no such conditional (only Diffuse Mix/Use Infill/
+    Spill Outside hide, and only based on flat_fill itself, never on gate
+    mode), so on a freshly-created channel this must hold for every mode.
+    """
+    bpy.ops.mask_luminance.channel_add()
+    channel = scene_settings.channels[0]
+
+    for mode in ("weight", "blue_paint", "color_id"):
+        channel.gate_mode = mode
+        channel.flat_fill = True
+        assert channel.flat_fill is True
+        assert channel.to_mask_channel().flat_fill is True
+        assert channel.to_mask_channel().gate_mode == mode
+
+        channel.flat_fill = False
+        assert channel.flat_fill is False
+        assert channel.to_mask_channel().flat_fill is False
+
+
 def test_bake_operator_requires_source(scene_settings):
     assert bpy.ops.mask_luminance.bake.poll() is False
 

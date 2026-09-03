@@ -61,6 +61,7 @@ class BakeState:
     flat_target: Optional[np.ndarray] = None
     channel_masks: Dict[str, np.ndarray] = field(default_factory=dict)
     step_index: int = 0
+    diffuse_color: Optional[np.ndarray] = None
 
     @property
     def total_steps(self) -> int:
@@ -145,6 +146,7 @@ def prepare_bake(
     self_locality_radius: float = core_blend.DEFAULT_SELF_LOCALITY_RADIUS,
     result_name: Optional[str] = None,
     max_dimension: Optional[int] = None,
+    diffuse_color_override: Optional[Sequence[float]] = None,
 ) -> BakeState:
     """Does every part of a bake that can't be split into per-channel steps.
 
@@ -152,6 +154,13 @@ def prepare_bake(
     construction, same ``feature_preserve`` composited-weights handling) but
     stops short of running the channel pipeline, returning a ``BakeState``
     for ``bake_step``/``bake_generator`` to advance instead.
+
+    ``diffuse_color_override``, if given, replaces the diffuse target (and
+    flat_fill target) with this flat RGB everywhere, bypassing
+    ``diffuse_mode`` — see ``core.blend.process_arrays``. Either way, the
+    resulting flat color (auto-detected or overridden) is recorded on
+    ``BakeState.diffuse_color`` for the panel to display; it is ``None`` only
+    for an un-overridden ``diffuse_mode='uv'``, which has no single color.
 
     ``max_dimension``, if given, downsamples the source texture first (see
     ``_downsample_to_max_dimension``) — every mask/diffuse/feature-preserve
@@ -194,16 +203,29 @@ def prepare_bake(
     if feature_preserve is not None:
         exclude = np.maximum(exclude, feature_preserve)
 
-    if diffuse_mode == "self":
+    diffuse_img = None
+    if diffuse_color_override is not None:
+        diffuse_target = np.broadcast_to(
+            np.asarray(diffuse_color_override, dtype=np.float32), sample.shape
+        ).copy()
+    elif diffuse_mode == "self":
         diffuse_target = core_blend.build_local_diffuse_target(sample, exclude, self_locality_radius)
     else:
         if diffuse_image is None:
             raise ValueError("diffuse_image is required unless diffuse_mode='self'.")
-        diffuse_target = core_blend.make_diffuse_target(sample, _extract(diffuse_image), diffuse_mode)
+        diffuse_img = _extract(diffuse_image)
+        diffuse_target = core_blend.make_diffuse_target(sample, diffuse_img, diffuse_mode)
 
     flat_target = None
     if any(ch.flat_fill for ch in active):
-        flat_target = core_blend.build_local_diffuse_target(sample, exclude, self_locality_radius, flat=True)
+        flat_target = diffuse_target if diffuse_color_override is not None else core_blend.build_local_diffuse_target(
+            sample, exclude, self_locality_radius, flat=True
+        )
+
+    if diffuse_color_override is not None:
+        diffuse_color = np.asarray(diffuse_color_override, dtype=np.float32)
+    else:
+        diffuse_color = core_blend.resolve_diffuse_color(sample, diffuse_mode, exclude, diffuse_img)
 
     return BakeState(
         working=sample.copy(),
@@ -215,6 +237,7 @@ def prepare_bake(
         feature_preserve=feature_preserve,
         result_name=result_name or result_image_name(source),
         flat_target=flat_target,
+        diffuse_color=diffuse_color,
     )
 
 
@@ -272,6 +295,7 @@ def run_bake(
     self_locality_radius: float = core_blend.DEFAULT_SELF_LOCALITY_RADIUS,
     result_name: Optional[str] = None,
     max_dimension: Optional[int] = None,
+    diffuse_color_override: Optional[Sequence[float]] = None,
 ) -> Tuple[bpy.types.Image, Dict[str, np.ndarray]]:
     """Bakes every enabled channel onto ``source`` synchronously and writes the result to an Image.
 
@@ -279,6 +303,44 @@ def run_bake(
     to back with no progress feedback — for tests, and for anything that
     doesn't need the modal/progress-overlay path. ``max_dimension`` is
     forwarded to ``prepare_bake``; see ``run_preview`` for the intended use.
+    See ``run_bake_with_color`` for a variant that also returns the resolved
+    flat diffuse color, used by the live-preview path to feed the panel's
+    diffuse-color swatch.
+    """
+    image, masks, _ = run_bake_with_color(
+        source, channels, mask_images,
+        diffuse_mode=diffuse_mode,
+        diffuse_image=diffuse_image,
+        feature_preserve_image=feature_preserve_image,
+        region_palette=region_palette,
+        luminance_only=luminance_only,
+        self_locality_radius=self_locality_radius,
+        result_name=result_name,
+        max_dimension=max_dimension,
+        diffuse_color_override=diffuse_color_override,
+    )
+    return image, masks
+
+
+def run_bake_with_color(
+    source: bpy.types.Image,
+    channels: Sequence[core_blend.MaskChannel],
+    mask_images: Dict[str, bpy.types.Image],
+    diffuse_mode: str = "self",
+    diffuse_image: Optional[bpy.types.Image] = None,
+    feature_preserve_image: Optional[bpy.types.Image] = None,
+    region_palette: Optional[Dict[str, Tuple[int, int, int]]] = None,
+    luminance_only: bool = True,
+    self_locality_radius: float = core_blend.DEFAULT_SELF_LOCALITY_RADIUS,
+    result_name: Optional[str] = None,
+    max_dimension: Optional[int] = None,
+    diffuse_color_override: Optional[Sequence[float]] = None,
+) -> Tuple[bpy.types.Image, Dict[str, np.ndarray], Optional[np.ndarray]]:
+    """``run_bake``, plus the resolved flat diffuse color (see ``BakeState.diffuse_color``).
+
+    A separate function (rather than changing ``run_bake``'s return value)
+    so existing callers that only want the Image/masks pair keep working
+    unchanged.
     """
     state = prepare_bake(
         source, channels, mask_images,
@@ -290,10 +352,11 @@ def run_bake(
         self_locality_radius=self_locality_radius,
         result_name=result_name,
         max_dimension=max_dimension,
+        diffuse_color_override=diffuse_color_override,
     )
     while bake_step(state):
         pass
-    return finalize_bake(state), state.channel_masks
+    return finalize_bake(state), state.channel_masks, state.diffuse_color
 
 
 DEFAULT_PREVIEW_MAX_DIMENSION = 384
@@ -311,6 +374,7 @@ def run_preview(
     luminance_only: bool = True,
     self_locality_radius: float = core_blend.DEFAULT_SELF_LOCALITY_RADIUS,
     max_dimension: int = DEFAULT_PREVIEW_MAX_DIMENSION,
+    diffuse_color_override: Optional[Sequence[float]] = None,
 ) -> bpy.types.Image:
     """``run_bake`` at proxy resolution, into a dedicated ``<source>_preview`` Image.
 
@@ -321,9 +385,43 @@ def run_preview(
     incomplete channels (e.g. one added but not yet given a mask) rather
     than raise should filter ``channels``/``mask_images`` themselves before
     calling this — it has the same "every enabled channel needs a mask"
-    contract as ``run_bake``.
+    contract as ``run_bake``. See ``run_preview_with_color`` for a variant
+    that also returns the resolved flat diffuse color.
     """
-    result_image, _ = run_bake(
+    image, _ = run_preview_with_color(
+        source, channels, mask_images,
+        diffuse_mode=diffuse_mode,
+        diffuse_image=diffuse_image,
+        feature_preserve_image=feature_preserve_image,
+        region_palette=region_palette,
+        luminance_only=luminance_only,
+        self_locality_radius=self_locality_radius,
+        max_dimension=max_dimension,
+        diffuse_color_override=diffuse_color_override,
+    )
+    return image
+
+
+def run_preview_with_color(
+    source: bpy.types.Image,
+    channels: Sequence[core_blend.MaskChannel],
+    mask_images: Dict[str, bpy.types.Image],
+    diffuse_mode: str = "self",
+    diffuse_image: Optional[bpy.types.Image] = None,
+    feature_preserve_image: Optional[bpy.types.Image] = None,
+    region_palette: Optional[Dict[str, Tuple[int, int, int]]] = None,
+    luminance_only: bool = True,
+    self_locality_radius: float = core_blend.DEFAULT_SELF_LOCALITY_RADIUS,
+    max_dimension: int = DEFAULT_PREVIEW_MAX_DIMENSION,
+    diffuse_color_override: Optional[Sequence[float]] = None,
+) -> Tuple[bpy.types.Image, Optional[np.ndarray]]:
+    """``run_preview``, plus the resolved flat diffuse color for the panel's swatch.
+
+    Cheap to call on every settled property change (same proxy-resolution
+    budget as ``run_preview``) since it reuses ``prepare_bake``'s downsampled
+    array cache rather than re-extracting full-resolution pixels.
+    """
+    result_image, _, diffuse_color = run_bake_with_color(
         source, channels, mask_images,
         diffuse_mode=diffuse_mode,
         diffuse_image=diffuse_image,
@@ -333,5 +431,6 @@ def run_preview(
         self_locality_radius=self_locality_radius,
         result_name=result_image_name(source, suffix=PREVIEW_SUFFIX),
         max_dimension=max_dimension,
+        diffuse_color_override=diffuse_color_override,
     )
-    return result_image
+    return result_image, diffuse_color

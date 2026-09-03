@@ -15,10 +15,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap, QResizeEvent, QWheelEvent
+from PyQt6.QtGui import QColor, QImage, QPixmap, QResizeEvent, QWheelEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -51,6 +52,7 @@ from matte_luminance_blend import (
     load_rgb,
     make_diffuse_target,
     resize_to,
+    resolve_diffuse_color,
     run_channel_pipeline,
     save_rgb,
 )
@@ -128,6 +130,84 @@ class _SliderSpin(QWidget):
 
     def setValue(self, v: float) -> None:
         self.spin.setValue(v)
+
+
+# ---------------------------------------------------------------------------
+# Diffuse color: shows the value the pipeline resolved to, with a manual override
+# ---------------------------------------------------------------------------
+class DiffuseColorRow(QWidget):
+    """Swatch showing the diffuse color the last run resolved to, plus an override.
+
+    With override off, the swatch/text just mirror whatever ``ProcessWorker``
+    reports back as the diffuse color it actually used (the auto-detected
+    'self' mean, the 'palette' sample, or nothing for 'uv' mode — see
+    ``set_unavailable``). Checking "Override" lets the user hand-pick a flat
+    RGB instead, starting from whatever was last computed so it reads as
+    "lock in this value" rather than resetting to some arbitrary default.
+    """
+
+    changed = pyqtSignal()
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._color: Tuple[float, float, float] = (128.0, 128.0, 128.0)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.swatch = QLabel()
+        self.swatch.setFixedSize(28, 20)
+        self.swatch.setFrameShape(QFrame.Shape.Box)
+
+        self.text = QLabel("—")
+        self.text.setMinimumWidth(100)
+
+        self.override_check = QCheckBox("Override")
+        self.pick_btn = QPushButton("Pick…")
+        self.pick_btn.setEnabled(False)
+        self.pick_btn.setFixedWidth(60)
+
+        layout.addWidget(self.swatch)
+        layout.addWidget(self.text)
+        layout.addWidget(self.override_check)
+        layout.addWidget(self.pick_btn)
+        layout.addStretch(1)
+
+        self.override_check.toggled.connect(self._on_override_toggled)
+        self.pick_btn.clicked.connect(self._on_pick)
+
+        self._update_swatch()
+
+    def _on_override_toggled(self, on: bool) -> None:
+        self.pick_btn.setEnabled(on)
+        self.changed.emit()
+
+    def _on_pick(self) -> None:
+        r, g, b = (int(round(c)) for c in self._color)
+        chosen = QColorDialog.getColor(QColor(r, g, b), self, "Pick diffuse color")
+        if chosen.isValid():
+            self._color = (float(chosen.red()), float(chosen.green()), float(chosen.blue()))
+            self._update_swatch()
+            self.changed.emit()
+
+    def set_computed_color(self, rgb) -> None:
+        """Updates the displayed color from the pipeline's actually-used value."""
+        self._color = (float(rgb[0]), float(rgb[1]), float(rgb[2]))
+        self._update_swatch()
+
+    def set_unavailable(self) -> None:
+        self.text.setText("N/A (UV diffuse map)")
+
+    def _update_swatch(self) -> None:
+        r, g, b = (int(round(float(np.clip(c, 0, 255)))) for c in self._color)
+        self.swatch.setStyleSheet(f"background-color: rgb({r},{g},{b}); border: 1px solid #888;")
+        self.text.setText(f"{r}, {g}, {b}")
+
+    def is_override_enabled(self) -> bool:
+        return self.override_check.isChecked()
+
+    def override_color(self) -> Optional[Tuple[float, float, float]]:
+        return self._color if self.is_override_enabled() else None
 
 
 # ---------------------------------------------------------------------------
@@ -450,19 +530,38 @@ class ProcessWorker(QThread):
                 )
 
             palette = DEFAULT_REGION_PALETTE
-            if p["diffuse_mode"] == "self":
-                exclude = np.zeros(sample.shape[:2], dtype=np.float32)
-                for ch in active:
-                    exclude = np.maximum(exclude, compute_channel_gate(mask_imgs[ch.name], ch, palette))
-                if feature_preserve is not None:
-                    exclude = np.maximum(exclude, feature_preserve)
+            exclude = np.zeros(sample.shape[:2], dtype=np.float32)
+            for ch in active:
+                exclude = np.maximum(exclude, compute_channel_gate(mask_imgs[ch.name], ch, palette))
+            if feature_preserve is not None:
+                exclude = np.maximum(exclude, feature_preserve)
+
+            diffuse_color_override = p.get("diffuse_color_override")
+            diffuse_img = None
+            if diffuse_color_override is not None:
+                diffuse_target = np.broadcast_to(
+                    np.asarray(diffuse_color_override, dtype=np.float32), sample.shape
+                ).copy()
+            elif p["diffuse_mode"] == "self":
                 diffuse_target = build_local_diffuse_target(sample, exclude, p["self_locality_radius"])
             else:
                 diffuse_img = load_rgb(p["diffuse_path"])
                 diffuse_target = make_diffuse_target(sample, diffuse_img, p["diffuse_mode"])
 
+            flat_target = None
+            if any(ch.flat_fill for ch in active):
+                if diffuse_color_override is not None:
+                    flat_target = diffuse_target
+                else:
+                    flat_target = build_local_diffuse_target(sample, exclude, p["self_locality_radius"], flat=True)
+
+            if diffuse_color_override is not None:
+                diffuse_color = np.asarray(diffuse_color_override, dtype=np.float32)
+            else:
+                diffuse_color = resolve_diffuse_color(sample, p["diffuse_mode"], exclude, diffuse_img)
+
             working, soft_masks = run_channel_pipeline(
-                sample, diffuse_target, mask_imgs, active, palette, p["luminance_only"], feature_preserve,
+                sample, diffuse_target, mask_imgs, active, palette, p["luminance_only"], feature_preserve, flat_target,
             )
             channel_masks = {
                 name: np.clip(soft * 255.0, 0, 255).astype(np.uint8) for name, soft in soft_masks.items()
@@ -472,6 +571,7 @@ class ProcessWorker(QThread):
                 "texture": working,
                 "sample": sample,
                 "channel_masks": channel_masks,
+                "diffuse_color": diffuse_color,
             }
 
             if self.write_outputs:
@@ -556,6 +656,11 @@ class MatteBlendWindow(QMainWindow):
         )
         io.addRow("Self-mode locality radius (px)", self.self_locality_radius)
         self.self_locality_radius.valueChanged.connect(self._schedule_live_preview)
+
+        self.diffuse_color_row = DiffuseColorRow()
+        self.diffuse_color_row.changed.connect(self._schedule_live_preview)
+        io.addRow("Diffuse color", self.diffuse_color_row)
+
         self._controls_layout.addWidget(io_box)
 
         # --- Mask channels ----------------------------------------------------
@@ -736,10 +841,13 @@ class MatteBlendWindow(QMainWindow):
         texture = self.texture_edit.text().strip()
         diffuse = self.diffuse_edit.text().strip()
         diffuse_mode = self.diffuse_mode.currentText()
+        diffuse_color_override = self.diffuse_color_row.override_color()
         if not texture or not os.path.isfile(texture):
             raise FileNotFoundError("Select a valid texture (albedo) image.")
-        if diffuse_mode != "self" and (not diffuse or not os.path.isfile(diffuse)):
-            raise FileNotFoundError("Select a valid diffuse image (or switch diffuse mode to 'self').")
+        if diffuse_mode != "self" and diffuse_color_override is None and (not diffuse or not os.path.isfile(diffuse)):
+            raise FileNotFoundError(
+                "Select a valid diffuse image, switch diffuse mode to 'self', or enable a diffuse color override."
+            )
 
         feature = self.feature_edit.text().strip() or None
         if feature and not os.path.isfile(feature):
@@ -760,6 +868,7 @@ class MatteBlendWindow(QMainWindow):
             channels=channels,
             diffuse_path=diffuse,
             diffuse_mode=diffuse_mode,
+            diffuse_color_override=diffuse_color_override,
             self_locality_radius=self.self_locality_radius.value(),
             feature_preserve_path=feature,
             luminance_only=self.chk_luma_only.isChecked(),
@@ -812,6 +921,12 @@ class MatteBlendWindow(QMainWindow):
         self.viewers["result"].set_image(result["texture"])
         self.viewers["sample"].set_image(result["sample"])
         self._rebuild_mask_tabs(result["channel_masks"])
+
+        diffuse_color = result.get("diffuse_color")
+        if diffuse_color is not None:
+            self.diffuse_color_row.set_computed_color(diffuse_color)
+        else:
+            self.diffuse_color_row.set_unavailable()
 
         if "paths" in result:
             paths = result["paths"]
