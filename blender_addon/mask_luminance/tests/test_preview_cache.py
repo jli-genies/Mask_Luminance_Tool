@@ -10,11 +10,13 @@ invalidation) rather than timing, which isn't a reliable pytest assertion.
 
 from __future__ import annotations
 
+import bmesh
 import bpy
 import numpy as np
 import pytest
 
 from mask_luminance.scene import bake as scene_bake
+from mask_luminance.scene import uv_bounds
 from mask_luminance.scene.images import image_to_rgb
 
 
@@ -120,3 +122,38 @@ def test_pointer_property_change_invalidates_the_cache(request, mask_image, repo
         assert cached_again is not cached_first
     finally:
         bpy.data.images.remove(other_image)
+
+
+def test_clear_preview_cache_also_clears_uv_bounds_cache():
+    """The one "Clear Preview Cache" button/no-arg call must cover uv_bounds too.
+
+    Every pointer-property change (including the UV source object) routes
+    through clear_preview_cache()'s no-arg path — see
+    operators._on_preview_relevant_pointer_change — so UV rasterizations need
+    no separate invalidation wiring as long as this holds.
+    """
+    mesh = bpy.data.meshes.new("uv_cache_test_mesh")
+    bm = bmesh.new()
+    try:
+        v_a = bm.verts.new((0.0, 0.0, 0.0))
+        v_b = bm.verts.new((1.0, 0.0, 0.0))
+        v_c = bm.verts.new((1.0, 1.0, 0.0))
+        v_d = bm.verts.new((0.0, 1.0, 0.0))
+        face = bm.faces.new((v_a, v_b, v_c, v_d))
+        layer = bm.loops.layers.uv.new("UVMap")
+        for loop, uv in zip(face.loops, [(0, 0), (1, 0), (1, 1), (0, 1)]):
+            loop[layer].uv = uv
+        bm.to_mesh(mesh)
+    finally:
+        bm.free()
+    obj = bpy.data.objects.new("uv_cache_test_obj", mesh)
+
+    try:
+        first = uv_bounds.rasterize_uv_bounds(obj, (32, 32))
+        scene_bake.clear_preview_cache()
+        second = uv_bounds.rasterize_uv_bounds(obj, (32, 32))
+        assert second is not first
+        np.testing.assert_array_equal(first, second)
+    finally:
+        bpy.data.objects.remove(obj)
+        bpy.data.meshes.remove(mesh)

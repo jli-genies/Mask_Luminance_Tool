@@ -38,6 +38,8 @@ import bpy
 import numpy as np
 
 from ..core import blend as core_blend
+from ..core import color as core_color
+from . import uv_bounds
 from .images import image_to_rgb, result_image_name, rgb_to_image
 
 
@@ -62,6 +64,10 @@ class BakeState:
     channel_masks: Dict[str, np.ndarray] = field(default_factory=dict)
     step_index: int = 0
     diffuse_color: Optional[np.ndarray] = None
+    out_of_bounds: Optional[np.ndarray] = None
+    exposure: float = 0.0
+    gamma: float = 1.0
+    shadow_bias: float = 0.0
 
     @property
     def total_steps(self) -> int:
@@ -126,9 +132,18 @@ def _cached_downsampled_rgb(image: bpy.types.Image, max_dimension: int, nearest:
 
 
 def clear_preview_cache(image_name: Optional[str] = None) -> None:
-    """Drops cached preview arrays. With no argument, clears every entry."""
+    """Drops cached preview arrays. With no argument, clears every entry.
+
+    A no-argument call also clears ``uv_bounds``'s own rasterization cache —
+    every pointer-property change (source/mask/diffuse/feature-preserve
+    *and* the UV source object) already routes through this "clear
+    everything" path (see operators.py's pointer-change callback), so UV
+    rasterizations stay covered by the same single cache-invalidation story
+    with no separate wiring needed.
+    """
     if image_name is None:
         _preview_array_cache.clear()
+        uv_bounds.clear_uv_bounds_cache()
         return
     for key in [k for k in _preview_array_cache if k[0] == image_name]:
         del _preview_array_cache[key]
@@ -147,6 +162,11 @@ def prepare_bake(
     result_name: Optional[str] = None,
     max_dimension: Optional[int] = None,
     diffuse_color_override: Optional[Sequence[float]] = None,
+    uv_source_object: Optional[bpy.types.Object] = None,
+    uv_layer_name: str = "",
+    exposure: float = 0.0,
+    gamma: float = 1.0,
+    shadow_bias: float = 0.0,
 ) -> BakeState:
     """Does every part of a bake that can't be split into per-channel steps.
 
@@ -161,6 +181,11 @@ def prepare_bake(
     resulting flat color (auto-detected or overridden) is recorded on
     ``BakeState.diffuse_color`` for the panel to display; it is ``None`` only
     for an un-overridden ``diffuse_mode='uv'``, which has no single color.
+
+    ``exposure``/``gamma``/``shadow_bias``, if not left at their neutral
+    defaults, are stashed on the returned ``BakeState`` and applied by
+    ``finalize_bake`` as one final global grade after every channel has run
+    — see ``core.color.apply_exposure_gamma``.
 
     ``max_dimension``, if given, downsamples the source texture first (see
     ``_downsample_to_max_dimension``) — every mask/diffuse/feature-preserve
@@ -203,13 +228,24 @@ def prepare_bake(
     if feature_preserve is not None:
         exclude = np.maximum(exclude, feature_preserve)
 
+    # Rasterized directly at sample_hw (already the preview-downsampled
+    # resolution when max_dimension is set), so no separate resize step is
+    # needed — uv_bounds' own cache (keyed on (object, uv layer, resolution))
+    # then makes repeated preview ticks at that resolution free after the
+    # first. See scene.uv_bounds for what this actually clips.
+    out_of_bounds = None
+    if uv_source_object is not None:
+        out_of_bounds = uv_bounds.out_of_bounds_mask(uv_source_object, sample_hw, uv_layer_name or None)
+
     diffuse_img = None
     if diffuse_color_override is not None:
         diffuse_target = np.broadcast_to(
             np.asarray(diffuse_color_override, dtype=np.float32), sample.shape
         ).copy()
     elif diffuse_mode == "self":
-        diffuse_target = core_blend.build_local_diffuse_target(sample, exclude, self_locality_radius)
+        diffuse_target = core_blend.build_local_diffuse_target(
+            sample, exclude, self_locality_radius, out_of_bounds=out_of_bounds
+        )
     else:
         if diffuse_image is None:
             raise ValueError("diffuse_image is required unless diffuse_mode='self'.")
@@ -219,13 +255,15 @@ def prepare_bake(
     flat_target = None
     if any(ch.flat_fill for ch in active):
         flat_target = diffuse_target if diffuse_color_override is not None else core_blend.build_local_diffuse_target(
-            sample, exclude, self_locality_radius, flat=True
+            sample, exclude, self_locality_radius, flat=True, out_of_bounds=out_of_bounds
         )
 
     if diffuse_color_override is not None:
         diffuse_color = np.asarray(diffuse_color_override, dtype=np.float32)
     else:
-        diffuse_color = core_blend.resolve_diffuse_color(sample, diffuse_mode, exclude, diffuse_img)
+        diffuse_color = core_blend.resolve_diffuse_color(
+            sample, diffuse_mode, exclude, diffuse_img, out_of_bounds=out_of_bounds
+        )
 
     return BakeState(
         working=sample.copy(),
@@ -238,6 +276,10 @@ def prepare_bake(
         result_name=result_name or result_image_name(source),
         flat_target=flat_target,
         diffuse_color=diffuse_color,
+        out_of_bounds=out_of_bounds,
+        exposure=exposure,
+        gamma=gamma,
+        shadow_bias=shadow_bias,
     )
 
 
@@ -253,13 +295,13 @@ def bake_step(state: BakeState) -> bool:
     if isinstance(item, list):
         state.working, group_soft = core_blend.apply_blend_group(
             state.working, state.diffuse_target, state.mask_arrays, item, state.palette,
-            state.luminance_only, state.feature_preserve, state.flat_target,
+            state.luminance_only, state.feature_preserve, state.flat_target, state.out_of_bounds,
         )
         state.channel_masks.update(group_soft)
     else:
         state.working, soft = core_blend.apply_mask_channel(
             state.working, state.diffuse_target, state.mask_arrays[item.name], item, state.palette,
-            state.luminance_only, state.feature_preserve, state.flat_target,
+            state.luminance_only, state.feature_preserve, state.flat_target, state.out_of_bounds,
         )
         state.channel_masks[item.name] = soft
 
@@ -278,9 +320,21 @@ def bake_generator(state: BakeState) -> Generator[Tuple[int, int], None, None]:
 
 
 def finalize_bake(state: BakeState) -> bpy.types.Image:
-    """Writes the (fully-stepped) result into an Image datablock."""
+    """Writes the (fully-stepped) result into an Image datablock.
+
+    Applies the global exposure/gamma grade (if not left at its neutral
+    defaults) here, after every channel's own step has run and before the
+    result ever reaches an Image datablock — the same point a fresh
+    ``run_preview`` recomputes it from, so the live preview and a real bake
+    always agree.
+    """
+    working = state.working
+    if state.exposure != 0.0 or state.gamma != 1.0 or state.shadow_bias != 0.0:
+        working = core_color.apply_exposure_gamma(
+            working, exposure=state.exposure, gamma=state.gamma, shadow_bias=state.shadow_bias
+        )
     existing = bpy.data.images.get(state.result_name)
-    return rgb_to_image(state.working, state.result_name, existing=existing, non_color=False)
+    return rgb_to_image(working, state.result_name, existing=existing, non_color=False)
 
 
 def run_bake(
@@ -296,6 +350,11 @@ def run_bake(
     result_name: Optional[str] = None,
     max_dimension: Optional[int] = None,
     diffuse_color_override: Optional[Sequence[float]] = None,
+    uv_source_object: Optional[bpy.types.Object] = None,
+    uv_layer_name: str = "",
+    exposure: float = 0.0,
+    gamma: float = 1.0,
+    shadow_bias: float = 0.0,
 ) -> Tuple[bpy.types.Image, Dict[str, np.ndarray]]:
     """Bakes every enabled channel onto ``source`` synchronously and writes the result to an Image.
 
@@ -318,6 +377,11 @@ def run_bake(
         result_name=result_name,
         max_dimension=max_dimension,
         diffuse_color_override=diffuse_color_override,
+        uv_source_object=uv_source_object,
+        uv_layer_name=uv_layer_name,
+        exposure=exposure,
+        gamma=gamma,
+        shadow_bias=shadow_bias,
     )
     return image, masks
 
@@ -335,6 +399,11 @@ def run_bake_with_color(
     result_name: Optional[str] = None,
     max_dimension: Optional[int] = None,
     diffuse_color_override: Optional[Sequence[float]] = None,
+    uv_source_object: Optional[bpy.types.Object] = None,
+    uv_layer_name: str = "",
+    exposure: float = 0.0,
+    gamma: float = 1.0,
+    shadow_bias: float = 0.0,
 ) -> Tuple[bpy.types.Image, Dict[str, np.ndarray], Optional[np.ndarray]]:
     """``run_bake``, plus the resolved flat diffuse color (see ``BakeState.diffuse_color``).
 
@@ -353,6 +422,11 @@ def run_bake_with_color(
         result_name=result_name,
         max_dimension=max_dimension,
         diffuse_color_override=diffuse_color_override,
+        uv_source_object=uv_source_object,
+        uv_layer_name=uv_layer_name,
+        exposure=exposure,
+        gamma=gamma,
+        shadow_bias=shadow_bias,
     )
     while bake_step(state):
         pass
@@ -375,6 +449,11 @@ def run_preview(
     self_locality_radius: float = core_blend.DEFAULT_SELF_LOCALITY_RADIUS,
     max_dimension: int = DEFAULT_PREVIEW_MAX_DIMENSION,
     diffuse_color_override: Optional[Sequence[float]] = None,
+    uv_source_object: Optional[bpy.types.Object] = None,
+    uv_layer_name: str = "",
+    exposure: float = 0.0,
+    gamma: float = 1.0,
+    shadow_bias: float = 0.0,
 ) -> bpy.types.Image:
     """``run_bake`` at proxy resolution, into a dedicated ``<source>_preview`` Image.
 
@@ -398,6 +477,11 @@ def run_preview(
         self_locality_radius=self_locality_radius,
         max_dimension=max_dimension,
         diffuse_color_override=diffuse_color_override,
+        uv_source_object=uv_source_object,
+        uv_layer_name=uv_layer_name,
+        exposure=exposure,
+        gamma=gamma,
+        shadow_bias=shadow_bias,
     )
     return image
 
@@ -414,6 +498,11 @@ def run_preview_with_color(
     self_locality_radius: float = core_blend.DEFAULT_SELF_LOCALITY_RADIUS,
     max_dimension: int = DEFAULT_PREVIEW_MAX_DIMENSION,
     diffuse_color_override: Optional[Sequence[float]] = None,
+    uv_source_object: Optional[bpy.types.Object] = None,
+    uv_layer_name: str = "",
+    exposure: float = 0.0,
+    gamma: float = 1.0,
+    shadow_bias: float = 0.0,
 ) -> Tuple[bpy.types.Image, Optional[np.ndarray]]:
     """``run_preview``, plus the resolved flat diffuse color for the panel's swatch.
 
@@ -432,5 +521,10 @@ def run_preview_with_color(
         result_name=result_image_name(source, suffix=PREVIEW_SUFFIX),
         max_dimension=max_dimension,
         diffuse_color_override=diffuse_color_override,
+        uv_source_object=uv_source_object,
+        uv_layer_name=uv_layer_name,
+        exposure=exposure,
+        gamma=gamma,
+        shadow_bias=shadow_bias,
     )
     return result_image, diffuse_color

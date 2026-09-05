@@ -63,7 +63,28 @@ def legacy_blend():
     if not legacy_path.exists():
         pytest.skip(f"Original tool not found at {legacy_path}")
     _ensure_genies_importable()
+    # matte_luminance_blend.py imports its sibling texture_edit.py by bare
+    # name -- fine when run as a script (Python auto-adds its own directory
+    # to sys.path), but importlib.util loading here bypasses that, so it
+    # needs the repo root on sys.path explicitly too.
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
     return _load_module_from_path("legacy_matte_luminance_blend", legacy_path)
+
+
+@pytest.fixture(scope="session")
+def standalone_texture_edit():
+    """The standalone repo's ``texture_edit.py``, genies import and all."""
+    module_path = REPO_ROOT / "texture_edit.py"
+    if not module_path.exists():
+        pytest.skip(f"texture_edit.py not found at {module_path}")
+    _ensure_genies_importable()
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    try:
+        return _load_module_from_path("standalone_texture_edit", module_path)
+    except ImportError as exc:
+        pytest.skip(f"texture_edit.py couldn't be imported (missing dependency: {exc})")
 
 
 @pytest.fixture(scope="session")

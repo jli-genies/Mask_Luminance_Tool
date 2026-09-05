@@ -118,6 +118,20 @@ class MaskChannel:
             ``composite_correction_targets``), so avoid pairing a
             ``flat_fill`` channel with others in the same group unless
             ``luminance_only`` is already off for the whole run.
+        mask_authoritative: Trust this channel's own gate weight as the
+            final per-pixel coverage directly, instead of additionally
+            gating it by how far the pixel's luminance differs from the
+            diffuse target (the ramp ``luminance_delta_mask``, or the
+            equivalent inline ramp in the ``flat_fill`` branch of
+            ``compute_channel_soft_mask``, otherwise apply). A hand-painted
+            mask is often only partially covered by that luminance-delta
+            ramp — any painted pixel whose luminance happens to already be
+            close to the diffuse target gets little or no correction weight,
+            leaving speckles of the original pixel visible through an
+            otherwise "fully covered" mask. Setting this makes coverage
+            exactly the mask's own (feature-preserve-adjusted) opacity, still
+            spatially feathered by ``radius`` exactly as before. Applies to
+            both the ``flat_fill`` and normal paths.
     """
 
     name: str
@@ -136,6 +150,7 @@ class MaskChannel:
     blend_group: Optional[str] = None
     blend_weight: float = 1.0
     flat_fill: bool = False
+    mask_authoritative: bool = False
 
     def __post_init__(self) -> None:
         if self.gate_mode not in GATE_MODES:
@@ -311,6 +326,7 @@ def estimate_diffuse_color(
     sample: np.ndarray,
     exclude_gate: np.ndarray,
     bg_threshold: float = 8.0,
+    out_of_bounds: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Mean RGB (float32, shape (3,)) of the sample's clean pixels outside ``exclude_gate``.
 
@@ -319,9 +335,14 @@ def estimate_diffuse_color(
     ``diffuse_mode='self'`` are centered on — surfaced as its own function so
     the addon UI can show/let the user override it without re-deriving the
     same "clean pixel" selection logic.
+
+    ``out_of_bounds``, if given, additionally excludes pixels not covered by
+    any real UV triangle (see ``scene.uv_bounds``) from the sample mean.
     """
     lum = luminance(sample)
     valid = (lum > bg_threshold) & (exclude_gate <= 0.5)
+    if out_of_bounds is not None:
+        valid = valid & ~out_of_bounds
     if not np.any(valid):
         raise ValueError(
             "Could not estimate a diffuse color: nothing left outside the "
@@ -336,6 +357,7 @@ def resolve_diffuse_color(
     diffuse_mode: str,
     exclude_gate: np.ndarray,
     diffuse_img: Optional[np.ndarray] = None,
+    out_of_bounds: Optional[np.ndarray] = None,
 ) -> Optional[np.ndarray]:
     """The single flat RGB the addon panel shows/lets the user override for this setup.
 
@@ -345,7 +367,7 @@ def resolve_diffuse_color(
     no one color to show and this returns ``None``.
     """
     if diffuse_mode == "self":
-        return estimate_diffuse_color(sample, exclude_gate)
+        return estimate_diffuse_color(sample, exclude_gate, out_of_bounds=out_of_bounds)
     if diffuse_mode == "palette" and diffuse_img is not None:
         return sample_palette_skin_rgb(diffuse_img)
     return None
@@ -357,6 +379,7 @@ def build_local_diffuse_target(
     radius: float,
     bg_threshold: float = 8.0,
     flat: bool = False,
+    out_of_bounds: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Reconstructs a diffuse target from the sample's own "clean" pixels.
 
@@ -383,9 +406,13 @@ def build_local_diffuse_target(
     A blur this wide is expensive at full texture resolution and pointless
     too, since only low-frequency content is wanted here anyway — so the
     blur runs on a downsampled copy and is upsampled back afterward.
+
+    ``out_of_bounds``, if given, additionally excludes pixels not covered by
+    any real UV triangle (see ``scene.uv_bounds``) from both the flat-mean
+    and shape-following reconstructions.
     """
     if flat:
-        mean = estimate_diffuse_color(sample, exclude_gate, bg_threshold)
+        mean = estimate_diffuse_color(sample, exclude_gate, bg_threshold, out_of_bounds=out_of_bounds)
         logger.info(
             "Flat self-fill target: mean skin RGB ≈ (%.1f, %.1f, %.1f)", mean[0], mean[1], mean[2],
         )
@@ -393,6 +420,8 @@ def build_local_diffuse_target(
 
     lum = luminance(sample)
     valid = (lum > bg_threshold) & (exclude_gate <= 0.5)
+    if out_of_bounds is not None:
+        valid = valid & ~out_of_bounds
     if not np.any(valid):
         raise ValueError(
             "Could not build a self-reference diffuse target: nothing left "
@@ -487,11 +516,17 @@ def luminance_delta_mask(
     diffuse_target: np.ndarray,
     threshold: float,
     gate: np.ndarray,
+    out_of_bounds: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Soft-threshold mask where |L_sample - L_diffuse| exceeds ``threshold``.
 
     Returns float32 weights in [0, 1]. Values below the threshold are 0; above
     they ramp toward 1 based on how far they exceed the threshold (capped).
+
+    ``out_of_bounds``, if given, marks pixels not covered by any real UV
+    triangle (see ``scene.uv_bounds``) — excluded here the same as the
+    near-black background heuristic below, since it is a strictly more
+    reliable signal when available.
     """
     d_l = np.abs(luminance(sample) - luminance(diffuse_target))
     # Hard gate: only pixels past the threshold participate.
@@ -503,6 +538,8 @@ def luminance_delta_mask(
 
     # Ignore empty UV background (near-black on sample).
     bg = luminance(sample) < 8.0
+    if out_of_bounds is not None:
+        bg = bg | out_of_bounds
     weights[bg] = 0.0
     return weights
 
@@ -511,6 +548,7 @@ def apply_blending_radius(
     mask: np.ndarray,
     radius: float,
     spill_outside: bool = False,
+    out_of_bounds: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Feathers ``mask``'s own edge over ``radius`` px without diluting its interior.
 
@@ -530,16 +568,27 @@ def apply_blending_radius(
     own footprint, carrying the nearest interior value outward with it
     (rather than fading from zero) so the spillover keeps real strength
     instead of trailing off to nothing immediately.
+
+    ``out_of_bounds``, if given, marks pixels not covered by any real UV
+    triangle (see ``scene.uv_bounds``). It is excluded from the
+    ``spill_outside`` extension's own source search (a gutter/neighboring-
+    island pixel can never be selected as the "nearest interior value" to
+    carry outward) and masked out of the final result unconditionally, so a
+    blur/feather can never actually land on a pixel outside real UV bounds
+    regardless of how ``radius`` compares to the gutter width.
     """
     if radius <= 0:
-        return mask
+        return mask if out_of_bounds is None else mask * (~out_of_bounds).astype(mask.dtype)
     footprint = mask > 1e-3
     if not np.any(footprint):
         return mask
 
     if spill_outside:
+        empty = ~footprint
+        if out_of_bounds is not None:
+            empty = empty | out_of_bounds
         extended = extend_texture_boundaries(
-            mask.astype(np.float32)[..., None], ~footprint, max_distance=None
+            mask.astype(np.float32)[..., None], empty, max_distance=None
         )[..., 0]
     else:
         extended = mask.astype(np.float32)
@@ -553,10 +602,17 @@ def apply_blending_radius(
     if not spill_outside:
         envelope = envelope * footprint.astype(np.float32)
 
-    return np.clip(extended * envelope, 0.0, 1.0).astype(np.float32)
+    result = np.clip(extended * envelope, 0.0, 1.0).astype(np.float32)
+    if out_of_bounds is not None:
+        result = result * (~out_of_bounds).astype(np.float32)
+    return result
 
 
-def feather_mask_outward(mask: np.ndarray, radius: float) -> np.ndarray:
+def feather_mask_outward(
+    mask: np.ndarray,
+    radius: float,
+    out_of_bounds: Optional[np.ndarray] = None,
+) -> np.ndarray:
     """Feathers ``mask`` outward only, never eroding its own interior.
 
     ``apply_blending_radius`` tapers a band *straddling* the mask's edge, so
@@ -575,9 +631,15 @@ def feather_mask_outward(mask: np.ndarray, radius: float) -> np.ndarray:
     the footprint. A larger radius then only widens how far the fill bleeds
     past the painted line into the surrounding texture; it can't weaken
     coverage of what was actually painted.
+
+    ``out_of_bounds``, if given, marks pixels not covered by any real UV
+    triangle (see ``scene.uv_bounds``) and is masked out of the result
+    unconditionally, so the outward bleed can never actually land past a
+    real UV island edge regardless of how ``radius`` compares to the gutter
+    width.
     """
     if radius <= 0:
-        return mask.astype(np.float32)
+        return mask.astype(np.float32) if out_of_bounds is None else mask.astype(np.float32) * (~out_of_bounds).astype(np.float32)
     footprint = mask > 1e-3
     if not np.any(footprint):
         return mask.astype(np.float32)
@@ -586,7 +648,10 @@ def feather_mask_outward(mask: np.ndarray, radius: float) -> np.ndarray:
     t = np.clip(1.0 - dist_out / radius, 0.0, 1.0)
     envelope = (t * t * (3.0 - 2.0 * t)).astype(np.float32)  # smoothstep, 1 inside footprint
 
-    return np.clip(np.maximum(mask.astype(np.float32), envelope), 0.0, 1.0).astype(np.float32)
+    result = np.clip(np.maximum(mask.astype(np.float32), envelope), 0.0, 1.0).astype(np.float32)
+    if out_of_bounds is not None:
+        result = result * (~out_of_bounds).astype(np.float32)
+    return result
 
 
 def masked_gaussian_blur(
@@ -613,6 +678,7 @@ def build_correction_target(
     diffuse_target: Optional[np.ndarray] = None,
     diffuse_mix: float = 0.0,
     use_infill: bool = True,
+    out_of_bounds: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Builds the full-image correction color a mask channel would blend toward.
 
@@ -623,6 +689,13 @@ def build_correction_target(
     plain local blur only softens a bright/mismatched patch — its own color
     stays baked into the kernel average near the center — while infill
     actually replaces the patch with the surrounding skin tone.
+
+    ``out_of_bounds``, if given, marks pixels not covered by any real UV
+    triangle (see ``scene.uv_bounds``) and is folded into the infill search's
+    ``empty_mask`` so a gutter/neighboring-island pixel can never be picked
+    as the "nearest surrounding color" — without this, a UV gutter narrower
+    than ``radius`` lets the infill search reach straight across it into
+    unrelated content.
     """
     diffuse_mix = float(np.clip(diffuse_mix, 0.0, 1.0))
     sample_f = sample.astype(np.float32)
@@ -644,7 +717,8 @@ def build_correction_target(
         repaint = sample_f
     elif use_infill:
         holes = mask.astype(np.float32) > 0.01
-        repaint = extend_texture_boundaries(sample_f, holes, max_distance=None)
+        source_empty = holes if out_of_bounds is None else (holes | out_of_bounds)
+        repaint = extend_texture_boundaries(sample_f, source_empty, max_distance=None)
         repaint = apply_extrapolation_blur(repaint, holes, radius)
     else:
         k = int(max(3, round(radius * 6) // 2 * 2 + 1))
@@ -668,13 +742,16 @@ def correct_region(
     diffuse_mix: float = 0.0,
     luminance_only: bool = True,
     use_infill: bool = True,
+    out_of_bounds: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Blends ``sample`` toward ``build_correction_target(...)`` by ``mask * strength``.
 
     This is the standalone (non-blend-group) application of the shared core
     algorithm — see ``build_correction_target`` for what the target is.
     """
-    target = build_correction_target(sample, mask, radius, diffuse_target, diffuse_mix, use_infill)
+    target = build_correction_target(
+        sample, mask, radius, diffuse_target, diffuse_mix, use_infill, out_of_bounds
+    )
     strength = float(np.clip(strength, 0.0, 1.0))
     w = np.clip(mask.astype(np.float32) * strength, 0.0, 1.0)
 
@@ -697,44 +774,71 @@ def compute_channel_soft_mask(
     channel: MaskChannel,
     palette: Dict[str, Tuple[int, int, int]],
     feature_preserve: Optional[np.ndarray] = None,
+    out_of_bounds: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Resolves one channel's soft weight mask: gate -> threshold -> feather."""
+    """Resolves one channel's soft weight mask: gate -> threshold -> feather.
+
+    ``out_of_bounds``, if given, marks pixels not covered by any real UV
+    triangle (see ``scene.uv_bounds``) and is used everywhere this function
+    (or the functions it calls) would otherwise guess "background" purely
+    from luminance.
+    """
     gate = compute_channel_gate(mask_img, channel, palette)
     if feature_preserve is not None:
         gate = gate * (1.0 - np.clip(feature_preserve, 0.0, 1.0))
 
+    real_bg = luminance(working) < 8.0
+    if out_of_bounds is not None:
+        real_bg = real_bg | out_of_bounds
+
     if channel.flat_fill:
         # An exact, hand-painted footprint: never erode it, only bleed
-        # outward past it — see feather_mask_outward(). Still gated by the
-        # luminance-delta threshold below (so a leaky/broad gate — e.g. a
-        # "weight" gate misapplied to a mostly-black mask image — needs an
-        # actual difference from the diffuse target to activate, not just
-        # any nonzero gate weight), but NOT via the shared
+        # outward past it — see feather_mask_outward(). By default (not
+        # channel.mask_authoritative) still gated by the luminance-delta
+        # threshold below (so a leaky/broad gate — e.g. a "weight" gate
+        # misapplied to a mostly-black mask image — needs an actual
+        # difference from the diffuse target to activate, not just any
+        # nonzero gate weight), but NOT via the shared
         # ``luminance_delta_mask``: its "sample luminance < 8 == empty UV
         # gutter" rule can't distinguish that from legitimately very dark
         # painted content (an inner lip line, near-black brow hairs) —
         # exactly what flat_fill exists to cover — and zeroed it out
         # completely, leaving the darkest, most visible part of the painted
-        # feature uncovered. That background check is reproduced here but
-        # applied only *outside* the gate, where it's protecting real
-        # background from the outward bleed rather than erasing intended
-        # coverage.
-        d_l = np.abs(luminance(working) - luminance(diffuse_target))
-        over = np.maximum(d_l - channel.threshold, 0.0)
-        ramp = channel.threshold if channel.threshold > 1e-6 else 1.0
-        raw = np.clip(over / ramp, 0.0, 1.0).astype(np.float32) * gate.astype(np.float32)
-        outside_gate_bg = (gate <= 1e-3) & (luminance(working) < 8.0)
+        # feature uncovered. ``mask_authoritative`` skips this ramp
+        # entirely and trusts the mask's own opacity as full coverage,
+        # which avoids the same threshold leaving partial (blotchy)
+        # coverage inside pixels that don't happen to differ much in
+        # luminance from the diffuse target. Either way, background is
+        # reproduced here but applied only *outside* the gate, where it's
+        # protecting real background from the outward bleed rather than
+        # erasing intended coverage.
+        if channel.mask_authoritative:
+            raw = gate.astype(np.float32)
+        else:
+            d_l = np.abs(luminance(working) - luminance(diffuse_target))
+            over = np.maximum(d_l - channel.threshold, 0.0)
+            ramp = channel.threshold if channel.threshold > 1e-6 else 1.0
+            raw = np.clip(over / ramp, 0.0, 1.0).astype(np.float32) * gate.astype(np.float32)
+        outside_gate_bg = (gate <= 1e-3) & real_bg
         raw = raw * (~outside_gate_bg).astype(np.float32)
 
-        soft = feather_mask_outward(raw, channel.radius)
+        soft = feather_mask_outward(raw, channel.radius, out_of_bounds=out_of_bounds)
         soft = soft * (~outside_gate_bg).astype(np.float32)
         return soft
 
-    raw = luminance_delta_mask(working, diffuse_target, channel.threshold, gate)
-    soft = apply_blending_radius(raw, channel.radius, spill_outside=channel.spill_outside)
+    if channel.mask_authoritative:
+        raw = gate.astype(np.float32) * (~real_bg).astype(np.float32)
+    else:
+        raw = luminance_delta_mask(
+            working, diffuse_target, channel.threshold, gate, out_of_bounds=out_of_bounds
+        )
+    soft = apply_blending_radius(
+        raw, channel.radius, spill_outside=channel.spill_outside, out_of_bounds=out_of_bounds
+    )
     if channel.spill_outside:
-        # Still exclude true UV background even while spilling into neighbors.
-        soft = soft * (luminance(working) >= 8.0).astype(np.float32)
+        # Still exclude true UV background/out-of-bounds even while
+        # spilling into neighbors.
+        soft = soft * (~real_bg).astype(np.float32)
     else:
         soft = soft * gate
     return soft
@@ -749,6 +853,7 @@ def apply_mask_channel(
     luminance_only: bool = True,
     feature_preserve: Optional[np.ndarray] = None,
     flat_target: Optional[np.ndarray] = None,
+    out_of_bounds: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Runs one mask channel's full pass: gate -> threshold -> feather -> correct.
 
@@ -763,7 +868,9 @@ def apply_mask_channel(
     diffuse_mix = 1.0 if channel.flat_fill else channel.diffuse_mix
     effective_luminance_only = False if channel.flat_fill else luminance_only
 
-    soft = compute_channel_soft_mask(working, target, mask_img, channel, palette, feature_preserve)
+    soft = compute_channel_soft_mask(
+        working, target, mask_img, channel, palette, feature_preserve, out_of_bounds
+    )
     new_working = correct_region(
         working,
         soft,
@@ -773,6 +880,7 @@ def apply_mask_channel(
         diffuse_mix=diffuse_mix,
         luminance_only=effective_luminance_only,
         use_infill=channel.use_infill,
+        out_of_bounds=out_of_bounds,
     )
     return new_working, soft
 
@@ -820,6 +928,7 @@ def apply_blend_group(
     luminance_only: bool = True,
     feature_preserve: Optional[np.ndarray] = None,
     flat_target: Optional[np.ndarray] = None,
+    out_of_bounds: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """Blends several channels' independent corrections into one result.
 
@@ -840,7 +949,9 @@ def apply_blend_group(
         ch_target = flat_target if (ch.flat_fill and flat_target is not None) else diffuse_target
         ch_diffuse_mix = 1.0 if ch.flat_fill else ch.diffuse_mix
 
-        soft = compute_channel_soft_mask(working, ch_target, mask_imgs[ch.name], ch, palette, feature_preserve)
+        soft = compute_channel_soft_mask(
+            working, ch_target, mask_imgs[ch.name], ch, palette, feature_preserve, out_of_bounds
+        )
         soft_masks[ch.name] = soft
         target = build_correction_target(
             working,
@@ -849,6 +960,7 @@ def apply_blend_group(
             diffuse_target=ch_target if ch_diffuse_mix > 0.0 else None,
             diffuse_mix=ch_diffuse_mix,
             use_infill=ch.use_infill,
+            out_of_bounds=out_of_bounds,
         )
         targets.append(target)
         strength = float(np.clip(ch.strength, 0.0, 1.0))
@@ -901,6 +1013,7 @@ def run_channel_pipeline(
     luminance_only: bool = True,
     feature_preserve: Optional[np.ndarray] = None,
     flat_target: Optional[np.ndarray] = None,
+    out_of_bounds: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """Runs every enabled channel over ``working``, in order.
 
@@ -909,7 +1022,9 @@ def run_channel_pipeline(
     name are instead run together through ``apply_blend_group`` the first
     time any of them is reached, so their results blend by coverage instead
     of overwriting each other. ``flat_target`` (see ``MaskChannel.flat_fill``)
-    is only used by channels that opt into it. Returns the final texture and
+    is only used by channels that opt into it. ``out_of_bounds`` (see
+    ``scene.uv_bounds``) is forwarded to every channel/group so none of them
+    can blur/infill past a real UV island edge. Returns the final texture and
     each channel's soft mask (for debug output).
     """
     working = working.copy()
@@ -919,7 +1034,7 @@ def run_channel_pipeline(
         if isinstance(item, list):
             working, group_soft = apply_blend_group(
                 working, diffuse_target, mask_imgs, item, palette, luminance_only, feature_preserve,
-                flat_target,
+                flat_target, out_of_bounds,
             )
             channel_masks.update(group_soft)
             logger.info(
@@ -929,7 +1044,7 @@ def run_channel_pipeline(
             ch = item
             working, soft = apply_mask_channel(
                 working, diffuse_target, mask_imgs[ch.name], ch, palette, luminance_only, feature_preserve,
-                flat_target,
+                flat_target, out_of_bounds,
             )
             channel_masks[ch.name] = soft
             logger.info(
@@ -953,6 +1068,7 @@ def process_arrays(
     feature_preserve_img: Optional[np.ndarray] = None,
     self_locality_radius: float = DEFAULT_SELF_LOCALITY_RADIUS,
     diffuse_color_override: Optional[Sequence[float]] = None,
+    out_of_bounds: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """Array-in/array-out version of ``process()`` — no file paths anywhere.
 
@@ -966,6 +1082,11 @@ def process_arrays(
     ``diffuse_color_override``, if given, replaces the diffuse target (and,
     for ``flat_fill`` channels, the flat fill color too) with this flat RGB
     everywhere, bypassing ``diffuse_mode`` entirely.
+
+    ``out_of_bounds`` (see ``scene.uv_bounds``), if given, marks pixels not
+    covered by any real UV triangle on the addon's source mesh — excluded
+    from every diffuse-target reconstruction and threaded through the whole
+    channel pipeline so blur/infill never crosses a real UV island edge.
     """
     palette = region_palette or DEFAULT_REGION_PALETTE
     active = [ch for ch in channels if ch.enabled]
@@ -985,7 +1106,9 @@ def process_arrays(
             np.asarray(diffuse_color_override, dtype=np.float32), sample.shape
         ).copy()
     elif diffuse_mode == "self":
-        diffuse_target = build_local_diffuse_target(sample, exclude, self_locality_radius)
+        diffuse_target = build_local_diffuse_target(
+            sample, exclude, self_locality_radius, out_of_bounds=out_of_bounds
+        )
     else:
         if diffuse_img is None:
             raise ValueError("diffuse_img is required unless diffuse_mode='self'.")
@@ -996,10 +1119,13 @@ def process_arrays(
         if diffuse_color_override is not None:
             flat_target = diffuse_target
         else:
-            flat_target = build_local_diffuse_target(sample, exclude, self_locality_radius, flat=True)
+            flat_target = build_local_diffuse_target(
+                sample, exclude, self_locality_radius, flat=True, out_of_bounds=out_of_bounds
+            )
 
     return run_channel_pipeline(
         sample, diffuse_target, mask_imgs, active, palette, luminance_only, feature_preserve, flat_target,
+        out_of_bounds,
     )
 
 

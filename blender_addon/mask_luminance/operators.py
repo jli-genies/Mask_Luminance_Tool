@@ -59,6 +59,30 @@ DIFFUSE_MODE_ITEMS = (
     ("palette", "Palette", "Sample a flat skin color from a multiview/palette render"),
 )
 
+MASK_TYPE_ITEMS = (
+    ("custom", "Custom", "Fully manual per-channel configuration"),
+    (
+        "shadow",
+        "Shadow",
+        "Full flat-fill toward the diffuse colour. Shares Radius/Strength/Use Infill with "
+        "every other Shadow channel and automatically unions with them",
+    ),
+    (
+        "highlight",
+        "Highlight",
+        "Partial dampen toward the diffuse colour (doesn't fully replace it). Shares "
+        "Radius/Strength/Use Infill/Diffuse Mix with every other Highlight channel and "
+        "automatically unions with them",
+    ),
+)
+
+# blend_group names reserved for the Shadow/Highlight auto-union — a Custom
+# channel using one of these by hand would silently join that union, so
+# MASKLUM_OT_bake.invoke rejects it (see the reserved-name check there).
+SHADOW_BLEND_GROUP = "__type_shadow__"
+HIGHLIGHT_BLEND_GROUP = "__type_highlight__"
+RESERVED_BLEND_GROUPS = {SHADOW_BLEND_GROUP, HIGHLIGHT_BLEND_GROUP}
+
 # How long to wait, after the *first* property change in a burst, before
 # actually recomputing the preview — not reset on each further change within
 # that window, so a continuous slider drag still gets refreshed at a steady
@@ -82,7 +106,7 @@ def _channels_and_masks_ready_for_preview(settings):
     for ch in settings.channels:
         if not ch.enabled or ch.mask_image is None:
             continue
-        channels.append(ch.to_mask_channel())
+        channels.append(ch.to_mask_channel(settings))
         mask_images[ch.channel_name] = ch.mask_image
     return channels, mask_images
 
@@ -115,6 +139,11 @@ def _run_preview_now(settings) -> None:
         self_locality_radius=settings.self_locality_radius,
         max_dimension=settings.preview_max_dimension,
         diffuse_color_override=_diffuse_color_override_255(settings),
+        uv_source_object=settings.uv_source_object,
+        uv_layer_name=settings.uv_layer_name,
+        exposure=settings.exposure,
+        gamma=settings.gamma,
+        shadow_bias=settings.shadow_bias,
     )
     _store_computed_diffuse_color(settings, diffuse_color)
 
@@ -192,8 +221,26 @@ class MASKLUM_PG_channel(PropertyGroup):
         default=False,
         update=_on_preview_relevant_change,
     )
+    mask_authoritative: BoolProperty(
+        name="Mask Authoritative",
+        description=(
+            "Trust this mask's own painted opacity as full coverage directly, instead of "
+            "additionally gating it by how far each pixel's luminance differs from the "
+            "diffuse target. Prevents blotchy partial coverage inside an exact hand-painted "
+            "mask whose pixels don't happen to differ much in luminance from the diffuse "
+            "target. Custom only — Shadow/Highlight always behave this way"
+        ),
+        default=False,
+        update=_on_preview_relevant_change,
+    )
+    mask_type: EnumProperty(
+        name="Mask Type",
+        items=MASK_TYPE_ITEMS,
+        default="custom",
+        update=_on_preview_relevant_change,
+    )
 
-    def to_mask_channel(self) -> core_blend.MaskChannel:
+    def to_mask_channel(self, settings: "MASKLUM_PG_settings") -> core_blend.MaskChannel:
         """Builds the core.blend.MaskChannel this property group represents.
 
         ``mask_path`` is a vestigial field on the dataclass (only the
@@ -201,30 +248,92 @@ class MASKLUM_PG_channel(PropertyGroup):
         it) — ``scene.run_bake`` resolves the mask by channel name against
         the ``mask_images`` dict it's given instead, so any placeholder value
         here is fine.
+
+        ``settings`` is needed to resolve the shared Shadow/Highlight
+        defaults when ``mask_type`` isn't "custom" — see
+        ``MASKLUM_PG_type_defaults``. ``threshold``, ``gate_mode``,
+        ``spill_outside``, ``fill_holes``, ``region_tolerance`` and
+        ``blend_weight`` stay per-channel regardless of type; only
+        radius/strength/use_infill(/diffuse_mix) are shared.
         """
+        if self.mask_type == "shadow":
+            d = settings.shadow_defaults
+            radius, strength, use_infill, diffuse_mix = d.radius, d.strength, d.use_infill, 0.0
+            flat_fill, mask_authoritative, blend_group = True, True, SHADOW_BLEND_GROUP
+        elif self.mask_type == "highlight":
+            d = settings.highlight_defaults
+            radius, strength, use_infill, diffuse_mix = d.radius, d.strength, d.use_infill, d.diffuse_mix
+            flat_fill, mask_authoritative, blend_group = False, True, HIGHLIGHT_BLEND_GROUP
+        else:
+            radius, strength, use_infill, diffuse_mix = self.radius, self.strength, self.use_infill, self.diffuse_mix
+            flat_fill, mask_authoritative = self.flat_fill, self.mask_authoritative
+            blend_group = self.blend_group or None
+
         return core_blend.MaskChannel(
             name=self.channel_name,
             mask_path=self.channel_name,
             enabled=self.enabled,
             gate_mode=self.gate_mode,
             threshold=self.threshold,
-            radius=self.radius,
-            strength=self.strength,
-            diffuse_mix=self.diffuse_mix,
-            use_infill=self.use_infill,
+            radius=radius,
+            strength=strength,
+            diffuse_mix=diffuse_mix,
+            use_infill=use_infill,
             spill_outside=self.spill_outside,
             fill_holes=self.fill_holes,
             region_tolerance=self.region_tolerance,
-            blend_group=self.blend_group or None,
+            blend_group=blend_group,
             blend_weight=self.blend_weight,
-            flat_fill=self.flat_fill,
+            flat_fill=flat_fill,
+            mask_authoritative=mask_authoritative,
         )
+
+
+class MASKLUM_PG_type_defaults(PropertyGroup):
+    """Radius/strength/infill/diffuse-mix shared by every channel of one Mask Type.
+
+    One shape reused for both ``MASKLUM_PG_settings.shadow_defaults`` and
+    ``.highlight_defaults`` — ``diffuse_mix`` simply isn't read for Shadow,
+    which is always a full flat-fill (see ``MASKLUM_PG_channel.to_mask_channel``).
+    Editing a field here live-updates every channel of that type at once,
+    since they all resolve from this same PropertyGroup instance rather than
+    each holding their own copy.
+    """
+
+    radius: FloatProperty(name="Radius", default=8.0, min=0.0, max=512.0, update=_on_preview_relevant_change)
+    strength: FloatProperty(name="Strength", default=0.85, min=0.0, max=1.0, update=_on_preview_relevant_change)
+    use_infill: BoolProperty(name="Use Infill", default=True, update=_on_preview_relevant_change)
+    diffuse_mix: FloatProperty(
+        name="Diffuse Mix",
+        description="Highlight only: how much to dampen toward the diffuse colour (0 = no change, 1 = full replace)",
+        default=0.5,
+        min=0.0,
+        max=1.0,
+        update=_on_preview_relevant_change,
+    )
 
 
 class MASKLUM_PG_settings(PropertyGroup):
     """Top-level addon state, stored on the Scene."""
 
     source: PointerProperty(name="Source Texture", type=bpy.types.Image, update=_on_preview_relevant_pointer_change)
+    uv_source_object: PointerProperty(
+        name="UV Source Mesh",
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == "MESH",
+        description=(
+            "Mesh whose real UV layout defines island boundaries, so blur/infill can be "
+            "clipped to them instead of guessing background from pixel brightness. Optional — "
+            "leave unset to fall back to the brightness heuristic"
+        ),
+        update=_on_preview_relevant_pointer_change,
+    )
+    uv_layer_name: StringProperty(
+        name="UV Map",
+        description="Name of the UV layer to use; empty uses the mesh's active UV layer",
+        default="",
+        update=_on_preview_relevant_pointer_change,
+    )
     diffuse_mode: EnumProperty(
         name="Diffuse Mode", items=DIFFUSE_MODE_ITEMS, default="self", update=_on_preview_relevant_change
     )
@@ -242,6 +351,34 @@ class MASKLUM_PG_settings(PropertyGroup):
         update=_on_preview_relevant_change,
     )
     luminance_only: BoolProperty(name="Luminance Only", default=True, update=_on_preview_relevant_change)
+
+    exposure: FloatProperty(
+        name="Exposure",
+        description="Stops applied in linear light to the finished bake, after every mask "
+                    "channel (0.0 = neutral; each +/-1.0 doubles/halves the signal)",
+        default=0.0,
+        min=-8.0,
+        max=8.0,
+        update=_on_preview_relevant_change,
+    )
+    gamma: FloatProperty(
+        name="Gamma",
+        description="Power curve applied to the finished bake's encoded signal (1.0 = "
+                    "neutral; >1.0 lifts midtones, <1.0 crushes them)",
+        default=1.0,
+        min=0.1,
+        max=8.0,
+        update=_on_preview_relevant_change,
+    )
+    shadow_bias: FloatProperty(
+        name="Shadow Bias",
+        description="Weights Exposure/Gamma by the pixel's own luminance -- 0 applies them "
+                    "uniformly, 1 applies their full effect in black, tapering to none in white",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        update=_on_preview_relevant_change,
+    )
 
     diffuse_color_computed: FloatVectorProperty(
         name="Diffuse Color (Computed)",
@@ -273,6 +410,9 @@ class MASKLUM_PG_settings(PropertyGroup):
 
     channels: CollectionProperty(type=MASKLUM_PG_channel)
     active_channel_index: IntProperty(default=0)
+
+    shadow_defaults: PointerProperty(type=MASKLUM_PG_type_defaults)
+    highlight_defaults: PointerProperty(type=MASKLUM_PG_type_defaults)
 
     live_preview: BoolProperty(
         name="Live Preview",
@@ -378,7 +518,17 @@ class MASKLUM_OT_bake(Operator):
     def invoke(self, context, event):
         settings = context.scene.mask_luminance
 
-        channels = [ch.to_mask_channel() for ch in settings.channels]
+        for ch in settings.channels:
+            if ch.enabled and ch.mask_type == "custom" and ch.blend_group in RESERVED_BLEND_GROUPS:
+                self.report(
+                    {"ERROR"},
+                    f"Channel '{ch.channel_name}' uses reserved Blend Group '{ch.blend_group}' "
+                    "(that name is reserved for the Shadow/Highlight mask-type auto-union) — "
+                    "rename it.",
+                )
+                return {"CANCELLED"}
+
+        channels = [ch.to_mask_channel(settings) for ch in settings.channels]
         mask_images = {}
         for ch in settings.channels:
             if not ch.enabled:
@@ -399,6 +549,11 @@ class MASKLUM_OT_bake(Operator):
                 luminance_only=settings.luminance_only,
                 self_locality_radius=settings.self_locality_radius,
                 diffuse_color_override=_diffuse_color_override_255(settings),
+                uv_source_object=settings.uv_source_object,
+                uv_layer_name=settings.uv_layer_name,
+                exposure=settings.exposure,
+                gamma=settings.gamma,
+                shadow_bias=settings.shadow_bias,
             )
         except (ValueError, KeyError) as exc:
             self.report({"ERROR"}, str(exc))
@@ -537,6 +692,17 @@ class MASKLUM_PT_main(Panel):
         layout.prop(settings, "luminance_only")
 
         layout.separator()
+        postproc_box = layout.box()
+        postproc_box.label(text="Post-process")
+        postproc_box.prop(settings, "exposure")
+        postproc_box.prop(settings, "gamma")
+        postproc_box.prop(settings, "shadow_bias")
+
+        layout.prop(settings, "uv_source_object")
+        if settings.uv_source_object is not None:
+            layout.prop(settings, "uv_layer_name")
+
+        layout.separator()
         diffuse_color_box = layout.box()
         diffuse_color_box.label(text="Diffuse Color")
         computed_row = diffuse_color_box.row()
@@ -565,21 +731,43 @@ class MASKLUM_PT_main(Panel):
             box = layout.box()
             box.prop(channel, "mask_image")
             box.prop(channel, "gate_mode")
+            box.prop(channel, "mask_type")
             box.prop(channel, "threshold")
-            box.prop(channel, "radius")
-            box.prop(channel, "strength")
-            box.prop(channel, "flat_fill")
-            if not channel.flat_fill:
-                box.prop(channel, "diffuse_mix")
-                box.prop(channel, "use_infill")
-                box.prop(channel, "spill_outside")
-            if channel.gate_mode == "weight":
-                box.prop(channel, "fill_holes")
-            if channel.gate_mode == "color_id":
-                box.prop(channel, "region_tolerance")
-            box.prop(channel, "blend_group")
-            if channel.blend_group:
-                box.prop(channel, "blend_weight")
+
+            if channel.mask_type == "custom":
+                box.prop(channel, "radius")
+                box.prop(channel, "strength")
+                box.prop(channel, "flat_fill")
+                box.prop(channel, "mask_authoritative")
+                if not channel.flat_fill:
+                    box.prop(channel, "diffuse_mix")
+                    box.prop(channel, "use_infill")
+                    box.prop(channel, "spill_outside")
+                if channel.gate_mode == "weight":
+                    box.prop(channel, "fill_holes")
+                if channel.gate_mode == "color_id":
+                    box.prop(channel, "region_tolerance")
+                box.prop(channel, "blend_group")
+                if channel.blend_group in RESERVED_BLEND_GROUPS:
+                    box.label(text="Reserved name — rename before baking", icon="ERROR")
+                if channel.blend_group:
+                    box.prop(channel, "blend_weight")
+            else:
+                shared = settings.shadow_defaults if channel.mask_type == "shadow" else settings.highlight_defaults
+                shared_box = box.box()
+                shared_box.label(text=f"Shared with every other {channel.mask_type.title()} channel")
+                shared_box.prop(shared, "radius")
+                shared_box.prop(shared, "strength")
+                shared_box.prop(shared, "use_infill")
+                if channel.mask_type == "highlight":
+                    shared_box.prop(shared, "diffuse_mix")
+                    box.prop(channel, "spill_outside")
+                if channel.gate_mode == "weight":
+                    box.prop(channel, "fill_holes")
+                if channel.gate_mode == "color_id":
+                    box.prop(channel, "region_tolerance")
+                blend_group = SHADOW_BLEND_GROUP if channel.mask_type == "shadow" else HIGHLIGHT_BLEND_GROUP
+                box.label(text=f"Blend group: {blend_group} (auto)")
 
         layout.separator()
         preview_row = layout.row(align=True)
@@ -598,6 +786,7 @@ class MASKLUM_PT_main(Panel):
 CLASSES = [
     MASKLUM_PG_BakeProgress,
     MASKLUM_PG_channel,
+    MASKLUM_PG_type_defaults,
     MASKLUM_PG_settings,
     MASKLUM_OT_channel_add,
     MASKLUM_OT_channel_remove,

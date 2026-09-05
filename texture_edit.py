@@ -4,10 +4,7 @@ from typing import Optional, Union
 import numpy as np
 from scipy.spatial import cKDTree
 
-from genies.meshutils import exchange
-from genies.meshutils.geometry.mesh_data.mesh_data import TmMeshData
 from genies.meshutils.shading.texture_utils import (
-  apply_color_correction,
   apply_extrapolation_blur,
   extrapolate_texture_volumetric,
   load_image_as_numpy,
@@ -24,6 +21,9 @@ SOFTNESS_FACTOR = 0.005
 # extrapolate_texture_volumetric's own donor_max_dist_factor, which is a
 # fraction of the mesh's 3D scale, not of the image.
 DONOR_MAX_DIST_FACTOR = 0.03
+# Approximate sRGB encode/decode curve used to round-trip exposure (a
+# linear-light operation) through the gamma-encoded 0-255 texture values.
+_ENCODE_GAMMA = 2.2
 
 
 def infill_from_mask(
@@ -163,6 +163,8 @@ def _fill_from_template(
   further channel (typically alpha) is left untouched, matching how the rest
   of the shading pipeline treats color as strictly RGB.
   """
+  from genies.meshutils.geometry.mesh_data.mesh_data import TmMeshData
+
   mesh_tm = _load_template_mesh(template_usd_file)
   size = img.shape[0]
 
@@ -209,6 +211,7 @@ def _load_template_mesh(usd_file: str):
   Raises:
     Exception: If the file holds no mesh primitive.
   """
+  from genies.meshutils import exchange
   from pxr import Usd, UsdGeom
 
   stage = Usd.Stage.Open(usd_file)
@@ -342,13 +345,30 @@ def apply_exposure_gamma(
   if img.shape[-1] == 1:
     img = np.repeat(img, 3, axis=-1)
 
-  # 3. Delegate to the same routine the bake pipeline uses, so this stays in
-  # lockstep with it instead of drifting with a second copy of the math.
-  corrected = apply_color_correction(img, {
-    "exposure": exposure,
-    "gamma": gamma,
-    "exp_shadow_bias": shadow_bias,
-  })
+  # 3. Exposure and gamma, computed directly rather than through
+  # apply_color_correction: that helper only implements brightness/contrast/
+  # saturation (see its own settings.get() keys), so passing it an
+  # "exposure"/"gamma"/"exp_shadow_bias" dict silently no-ops -- none of
+  # those keys match anything it reads.
+  if exposure == 0.0 and gamma == 1.0:
+    corrected = img
+  else:
+    encoded = np.clip(img.astype(np.float32) / 255.0, 0.0, 1.0)
+
+    linear = np.power(encoded, _ENCODE_GAMMA) * (2.0 ** exposure)
+    exposed = np.power(np.clip(linear, 0.0, None), 1.0 / _ENCODE_GAMMA)
+
+    safe_gamma = max(gamma, 1e-6)
+    graded = np.power(np.clip(exposed, 0.0, None), 1.0 / safe_gamma)
+
+    clamped_bias = float(np.clip(shadow_bias, 0.0, 1.0))
+    if clamped_bias > 0.0:
+      lum = (0.2126 * encoded[..., 0] + 0.7152 * encoded[..., 1]
+           + 0.0722 * encoded[..., 2])
+      weight = (1.0 - clamped_bias * lum)[..., np.newaxis]
+      graded = encoded * (1.0 - weight) + graded * weight
+
+    corrected = np.clip(graded * 255.0, 0, 255).astype(np.uint8)
 
   # 4. Commit the result to disk when a destination is requested.
   if output_path:

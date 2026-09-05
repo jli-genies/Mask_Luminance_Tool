@@ -56,6 +56,7 @@ from matte_luminance_blend import (
     run_channel_pipeline,
     save_rgb,
 )
+from texture_edit import apply_exposure_gamma
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
@@ -366,6 +367,15 @@ class ChannelPanel(QGroupBox):
 
         form = QFormLayout(self)
 
+        self.mask_type = QComboBox()
+        self.mask_type.addItems(["Custom", "Shadow", "Highlight"])
+        self.mask_type.setToolTip(
+            "One-shot preset: applies canned Shadow/Highlight values to this panel's own "
+            "fields below. Unlike the Blender addon, these fields are NOT kept in sync "
+            "across channels afterward — re-pick the type to re-apply if you change your mind."
+        )
+        form.addRow("Mask type (preset)", self.mask_type)
+
         mask_row = QWidget()
         mrl = QHBoxLayout(mask_row)
         mrl.setContentsMargins(0, 0, 0, 0)
@@ -419,6 +429,14 @@ class ChannelPanel(QGroupBox):
         self.flat_fill = QCheckBox("Flat fill (mean skin color instead of infill/blur)")
         form.addRow(self.flat_fill)
 
+        self.mask_authoritative = QCheckBox("Mask authoritative (use mask opacity directly)")
+        self.mask_authoritative.setToolTip(
+            "Skip the luminance-difference threshold and trust this mask's own painted "
+            "opacity as full coverage. Fixes blotchy partial coverage inside a hand-painted "
+            "mask whose pixels don't happen to differ much in luminance from the diffuse color."
+        )
+        form.addRow(self.mask_authoritative)
+
         self.blend_group = QLineEdit()
         self.blend_group.setPlaceholderText("optional — e.g. skin_uniform")
         form.addRow("Blend group", self.blend_group)
@@ -432,9 +450,11 @@ class ChannelPanel(QGroupBox):
         self.gate_mode.currentTextChanged.connect(self._on_gate_mode_changed)
         for w in (self.threshold, self.radius, self.strength, self.diffuse_mix, self.region_tolerance, self.blend_weight):
             w.valueChanged.connect(lambda *_: self.changed.emit())
-        for cb in (self.use_infill, self.spill_outside, self.fill_holes, self.flat_fill, *self.region_checks.values()):
+        for cb in (self.use_infill, self.spill_outside, self.fill_holes, self.flat_fill,
+                   self.mask_authoritative, *self.region_checks.values()):
             cb.toggled.connect(lambda *_: self.changed.emit())
         self.flat_fill.toggled.connect(self._on_flat_fill_toggled)
+        self.mask_type.currentTextChanged.connect(self._on_mask_type_changed)
         self.mask_edit.editingFinished.connect(self.changed.emit)
         self.blend_group.editingFinished.connect(self.changed.emit)
         self.toggled.connect(lambda *_: self.changed.emit())
@@ -456,6 +476,25 @@ class ChannelPanel(QGroupBox):
         self.diffuse_mix.setVisible(not on)
         self.use_infill.setVisible(not on)
         self.spill_outside.setVisible(not on)
+        self.changed.emit()
+
+    def _on_mask_type_changed(self, label: str) -> None:
+        """One-shot preset: applies canned values to this panel's own widgets.
+
+        Unlike the Blender addon's Mask Type (which keeps every channel of a
+        type live-linked to one shared setting), this is a lighter,
+        explicitly scoped-down convenience for this standalone tool: it just
+        fills in the fields below once, which you're then free to keep
+        editing individually. "Custom" applies nothing — it's the neutral
+        starting point, not a fourth preset.
+        """
+        if label == "Shadow":
+            self.flat_fill.setChecked(True)
+            self.mask_authoritative.setChecked(True)
+        elif label == "Highlight":
+            self.flat_fill.setChecked(False)
+            self.mask_authoritative.setChecked(True)
+            self.diffuse_mix.setValue(0.5)
         self.changed.emit()
 
     def _browse(self) -> None:
@@ -492,6 +531,7 @@ class ChannelPanel(QGroupBox):
             blend_group=self.blend_group.text().strip() or None,
             blend_weight=self.blend_weight.value(),
             flat_fill=self.flat_fill.isChecked(),
+            mask_authoritative=self.mask_authoritative.isChecked(),
         )
 
 
@@ -563,6 +603,11 @@ class ProcessWorker(QThread):
             working, soft_masks = run_channel_pipeline(
                 sample, diffuse_target, mask_imgs, active, palette, p["luminance_only"], feature_preserve, flat_target,
             )
+
+            exposure, gamma, shadow_bias = p["exposure"], p["gamma"], p["shadow_bias"]
+            if exposure != 0.0 or gamma != 1.0 or shadow_bias != 0.0:
+                working = apply_exposure_gamma(working, exposure=exposure, gamma=gamma, shadow_bias=shadow_bias)
+
             channel_masks = {
                 name: np.clip(soft * 255.0, 0, 255).astype(np.uint8) for name, soft in soft_masks.items()
             }
@@ -681,6 +726,19 @@ class MatteBlendWindow(QMainWindow):
         sf.addRow(self.chk_live)
         sf.addRow(self.chk_luma_only)
         self._controls_layout.addWidget(shared_box)
+
+        # --- Post-process (global exposure / gamma) --------------------------
+        postproc_box = QGroupBox("Post-process")
+        pf = QFormLayout(postproc_box)
+        self.exposure = _SliderSpin(-4.0, 4.0, 0.0, step=0.05, decimals=2, slider_scale=100)
+        self.gamma = _SliderSpin(0.1, 4.0, 1.0, step=0.02, decimals=2, slider_scale=100)
+        self.shadow_bias = _SliderSpin(0.0, 1.0, 0.0, step=0.01, decimals=2, slider_scale=100)
+        pf.addRow("Exposure (stops)", self.exposure)
+        pf.addRow("Gamma", self.gamma)
+        pf.addRow("Shadow bias", self.shadow_bias)
+        for w in (self.exposure, self.gamma, self.shadow_bias):
+            w.valueChanged.connect(self._schedule_live_preview)
+        self._controls_layout.addWidget(postproc_box)
 
         # --- Outputs --------------------------------------------------------
         out_box = QGroupBox("Outputs")
@@ -872,6 +930,9 @@ class MatteBlendWindow(QMainWindow):
             self_locality_radius=self.self_locality_radius.value(),
             feature_preserve_path=feature,
             luminance_only=self.chk_luma_only.isChecked(),
+            exposure=self.exposure.value(),
+            gamma=self.gamma.value(),
+            shadow_bias=self.shadow_bias.value(),
             out_texture_path=self.out_texture.text().strip(),
             out_masks_dir=self.out_masks_dir.text().strip() or None,
         )

@@ -13,6 +13,7 @@ from .bake import (
 )
 from .images import image_to_rgb, result_image_name, rgb_to_image
 from .progress_overlay import MASKLUM_PG_BakeProgress, overlay_begin, overlay_end, overlay_update, progress_props
+from .uv_bounds import clear_uv_bounds_cache, out_of_bounds_mask, rasterize_uv_bounds
 
 __all__ = [
     "DEFAULT_PREVIEW_MAX_DIMENSION",
@@ -34,4 +35,7 @@ __all__ = [
     "overlay_end",
     "overlay_update",
     "progress_props",
+    "clear_uv_bounds_cache",
+    "out_of_bounds_mask",
+    "rasterize_uv_bounds",
 ]

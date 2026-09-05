@@ -23,6 +23,7 @@ immediate-finish shortcut) behave correctly.
 
 from __future__ import annotations
 
+import bmesh
 import bpy
 import numpy as np
 import pytest
@@ -111,12 +112,12 @@ def test_flat_fill_available_regardless_of_gate_mode(scene_settings):
         channel.gate_mode = mode
         channel.flat_fill = True
         assert channel.flat_fill is True
-        assert channel.to_mask_channel().flat_fill is True
-        assert channel.to_mask_channel().gate_mode == mode
+        assert channel.to_mask_channel(scene_settings).flat_fill is True
+        assert channel.to_mask_channel(scene_settings).gate_mode == mode
 
         channel.flat_fill = False
         assert channel.flat_fill is False
-        assert channel.to_mask_channel().flat_fill is False
+        assert channel.to_mask_channel(scene_settings).flat_fill is False
 
 
 def test_bake_operator_requires_source(scene_settings):
@@ -187,3 +188,103 @@ def test_bake_operator_finishes_synchronously_with_zero_active_channels(scene_se
 
     baked_image = bpy.data.images[f"{scene_settings.source.name}_matte"]
     np.testing.assert_array_equal(image_to_rgb(baked_image), image_to_rgb(scene_settings.source))
+
+
+def test_shadow_mask_type_shares_settings_and_auto_unions(scene_settings):
+    bpy.ops.mask_luminance.channel_add()
+    bpy.ops.mask_luminance.channel_add()
+    ch1, ch2 = scene_settings.channels[0], scene_settings.channels[1]
+    ch1.mask_type = "shadow"
+    ch2.mask_type = "shadow"
+
+    scene_settings.shadow_defaults.radius = 33.0
+    scene_settings.shadow_defaults.strength = 0.42
+    scene_settings.shadow_defaults.use_infill = False
+
+    for channel in (ch1, ch2):
+        resolved = channel.to_mask_channel(scene_settings)
+        assert resolved.radius == pytest.approx(33.0)
+        assert resolved.strength == pytest.approx(0.42)
+        assert resolved.use_infill is False
+        assert resolved.flat_fill is True
+        assert resolved.mask_authoritative is True
+        assert resolved.blend_group == "__type_shadow__"
+
+
+def test_highlight_mask_type_shares_settings_and_auto_unions(scene_settings):
+    bpy.ops.mask_luminance.channel_add()
+    channel = scene_settings.channels[0]
+    channel.mask_type = "highlight"
+
+    scene_settings.highlight_defaults.radius = 5.0
+    scene_settings.highlight_defaults.strength = 0.3
+    scene_settings.highlight_defaults.use_infill = True
+    scene_settings.highlight_defaults.diffuse_mix = 0.65
+
+    resolved = channel.to_mask_channel(scene_settings)
+    assert resolved.radius == pytest.approx(5.0)
+    assert resolved.strength == pytest.approx(0.3)
+    assert resolved.use_infill is True
+    assert resolved.diffuse_mix == pytest.approx(0.65)
+    assert resolved.flat_fill is False
+    assert resolved.mask_authoritative is True
+    assert resolved.blend_group == "__type_highlight__"
+
+
+def test_reserved_blend_group_name_rejected_for_custom_channel(scene_settings, repo_root):
+    texture_path = repo_root / "test_textures" / "african_female_0003_albedo_from_concept.png"
+    mask_path = repo_root / "masks" / "shadow_mask_1.png"
+    if not texture_path.exists() or not mask_path.exists():
+        pytest.skip("Reference assets missing")
+
+    scene_settings.source = bpy.data.images.load(str(texture_path), check_existing=True)
+    bpy.ops.mask_luminance.channel_add()
+    channel = scene_settings.channels[0]
+    channel.channel_name = "custom_but_reserved"
+    channel.mask_image = bpy.data.images.load(str(mask_path), check_existing=True)
+    channel.mask_type = "custom"
+    channel.blend_group = "__type_shadow__"
+
+    with pytest.raises(RuntimeError, match="reserved Blend Group"):
+        bpy.ops.mask_luminance.bake()
+
+
+def test_uv_source_object_wired_into_bake_operator(scene_settings, repo_root):
+    texture_path = repo_root / "test_textures" / "african_female_0003_albedo_from_concept.png"
+    mask_path = repo_root / "masks" / "shadow_mask_1.png"
+    if not texture_path.exists() or not mask_path.exists():
+        pytest.skip("Reference assets missing")
+
+    scene_settings.source = bpy.data.images.load(str(texture_path), check_existing=True)
+    scene_settings.diffuse_mode = "self"
+    bpy.ops.mask_luminance.channel_add()
+    channel = scene_settings.channels[0]
+    channel.channel_name = "shadow_1"
+    channel.mask_image = bpy.data.images.load(str(mask_path), check_existing=True)
+
+    mesh = bpy.data.meshes.new("uv_wiring_test_mesh")
+    bm = bmesh.new()
+    try:
+        v_a = bm.verts.new((0.0, 0.0, 0.0))
+        v_b = bm.verts.new((1.0, 0.0, 0.0))
+        v_c = bm.verts.new((1.0, 1.0, 0.0))
+        v_d = bm.verts.new((0.0, 1.0, 0.0))
+        face = bm.faces.new((v_a, v_b, v_c, v_d))
+        layer = bm.loops.layers.uv.new("UVMap")
+        for loop, uv in zip(face.loops, [(0, 0), (1, 0), (1, 1), (0, 1)]):
+            loop[layer].uv = uv
+        bm.to_mesh(mesh)
+    finally:
+        bm.free()
+    obj = bpy.data.objects.new("uv_wiring_test_obj", mesh)
+    scene_settings.uv_source_object = obj
+
+    try:
+        # Reaching RUNNING_MODAL means prepare_bake() accepted uv_source_object
+        # and successfully rasterized/threaded it through with no error.
+        result = bpy.ops.mask_luminance.bake()
+        assert result == {"RUNNING_MODAL"}
+        bpy.context.window_manager.mask_luminance_bake_progress.active = False
+    finally:
+        bpy.data.objects.remove(obj)
+        bpy.data.meshes.remove(mesh)

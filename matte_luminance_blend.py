@@ -40,6 +40,8 @@ from genies.meshutils.shading.texture_utils import (
     extend_texture_boundaries,
 )
 
+from texture_edit import apply_exposure_gamma
+
 logger = logging.getLogger(__name__)
 
 # Default ID colors from the authored region mask (quantized / approximate).
@@ -124,6 +126,13 @@ class MaskChannel:
             ``composite_correction_targets``), so avoid pairing a
             ``flat_fill`` channel with others in the same group unless
             ``luminance_only`` is already off for the whole run.
+        mask_authoritative: Trust this channel's own gate weight as the
+            final per-pixel coverage directly, instead of additionally
+            gating it by how far the pixel's luminance differs from the
+            diffuse target. See ``compute_channel_soft_mask`` for where this
+            branches. Fixes blotchy partial coverage inside a hand-painted
+            mask whose pixels don't happen to differ much in luminance from
+            the diffuse target.
     """
 
     name: str
@@ -142,6 +151,7 @@ class MaskChannel:
     blend_group: Optional[str] = None
     blend_weight: float = 1.0
     flat_fill: bool = False
+    mask_authoritative: bool = False
 
     def __post_init__(self) -> None:
         if self.gate_mode not in GATE_MODES:
@@ -709,38 +719,51 @@ def compute_channel_soft_mask(
     if feature_preserve is not None:
         gate = gate * (1.0 - np.clip(feature_preserve, 0.0, 1.0))
 
+    real_bg = luminance(working) < 8.0
+
     if channel.flat_fill:
         # An exact, hand-painted footprint: never erode it, only bleed
-        # outward past it — see feather_mask_outward(). Still gated by the
-        # luminance-delta threshold below (so a leaky/broad gate — e.g. a
-        # "weight" gate misapplied to a mostly-black mask image — needs an
-        # actual difference from the diffuse target to activate, not just
-        # any nonzero gate weight), but NOT via the shared
+        # outward past it — see feather_mask_outward(). By default (not
+        # channel.mask_authoritative) still gated by the luminance-delta
+        # threshold below (so a leaky/broad gate — e.g. a "weight" gate
+        # misapplied to a mostly-black mask image — needs an actual
+        # difference from the diffuse target to activate, not just any
+        # nonzero gate weight), but NOT via the shared
         # ``luminance_delta_mask``: its "sample luminance < 8 == empty UV
         # gutter" rule can't distinguish that from legitimately very dark
         # painted content (an inner lip line, near-black brow hairs) —
         # exactly what flat_fill exists to cover — and zeroed it out
         # completely, leaving the darkest, most visible part of the painted
-        # feature uncovered. That background check is reproduced here but
+        # feature uncovered. ``mask_authoritative`` skips this ramp
+        # entirely and trusts the mask's own opacity as full coverage,
+        # avoiding the same threshold leaving partial (blotchy) coverage
+        # inside pixels that don't happen to differ much in luminance from
+        # the diffuse target. Either way, background is reproduced here but
         # applied only *outside* the gate, where it's protecting real
         # background from the outward bleed rather than erasing intended
         # coverage.
-        d_l = np.abs(luminance(working) - luminance(diffuse_target))
-        over = np.maximum(d_l - channel.threshold, 0.0)
-        ramp = channel.threshold if channel.threshold > 1e-6 else 1.0
-        raw = np.clip(over / ramp, 0.0, 1.0).astype(np.float32) * gate.astype(np.float32)
-        outside_gate_bg = (gate <= 1e-3) & (luminance(working) < 8.0)
+        if channel.mask_authoritative:
+            raw = gate.astype(np.float32)
+        else:
+            d_l = np.abs(luminance(working) - luminance(diffuse_target))
+            over = np.maximum(d_l - channel.threshold, 0.0)
+            ramp = channel.threshold if channel.threshold > 1e-6 else 1.0
+            raw = np.clip(over / ramp, 0.0, 1.0).astype(np.float32) * gate.astype(np.float32)
+        outside_gate_bg = (gate <= 1e-3) & real_bg
         raw = raw * (~outside_gate_bg).astype(np.float32)
 
         soft = feather_mask_outward(raw, channel.radius)
         soft = soft * (~outside_gate_bg).astype(np.float32)
         return soft
 
-    raw = luminance_delta_mask(working, diffuse_target, channel.threshold, gate)
+    if channel.mask_authoritative:
+        raw = gate.astype(np.float32) * (~real_bg).astype(np.float32)
+    else:
+        raw = luminance_delta_mask(working, diffuse_target, channel.threshold, gate)
     soft = apply_blending_radius(raw, channel.radius, spill_outside=channel.spill_outside)
     if channel.spill_outside:
         # Still exclude true UV background even while spilling into neighbors.
-        soft = soft * (luminance(working) >= 8.0).astype(np.float32)
+        soft = soft * (~real_bg).astype(np.float32)
     else:
         soft = soft * gate
     return soft
@@ -939,6 +962,9 @@ def process(
     out_masks_dir: Optional[str] = None,
     self_locality_radius: float = DEFAULT_SELF_LOCALITY_RADIUS,
     diffuse_color_override: Optional[Sequence[float]] = None,
+    exposure: float = 0.0,
+    gamma: float = 1.0,
+    shadow_bias: float = 0.0,
 ) -> Dict[str, str]:
     """Runs every enabled mask channel in order over ``texture_path``.
 
@@ -953,6 +979,11 @@ def process(
     for ``flat_fill`` channels, the flat fill color too) with this flat RGB
     everywhere, bypassing ``diffuse_mode`` entirely — for a user who wants to
     hand-pick the diffuse color instead of trusting the auto-detected one.
+
+    ``exposure``/``gamma``/``shadow_bias``, if not left at their neutral
+    defaults, apply a final global grade (see
+    ``texture_edit.apply_exposure_gamma``) to the fully channel-corrected
+    texture, after every mask channel has run.
     """
     sample = load_rgb(texture_path)
     palette = region_palette or DEFAULT_REGION_PALETTE
@@ -998,6 +1029,9 @@ def process(
     working, channel_masks = run_channel_pipeline(
         sample, diffuse_target, mask_imgs, active, palette, luminance_only, feature_preserve, flat_target,
     )
+
+    if exposure != 0.0 or gamma != 1.0 or shadow_bias != 0.0:
+        working = apply_exposure_gamma(working, exposure=exposure, gamma=gamma, shadow_bias=shadow_bias)
 
     results: Dict[str, str] = {}
     resolved_color = (
@@ -1086,6 +1120,28 @@ def main(argv: Optional[List[str]] = None) -> None:
         help="Override the auto-detected/sampled diffuse color (0-255 each) instead of "
              "using --diffuse-mode's computed value.",
     )
+    parser.add_argument(
+        "--exposure",
+        type=float,
+        default=0.0,
+        help="Stops applied in linear light to the final texture, after every mask channel "
+             "(0.0 = neutral; each +/-1.0 doubles/halves the signal).",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=1.0,
+        help="Power curve applied to the final texture's encoded signal (1.0 = neutral; "
+             ">1.0 lifts midtones, <1.0 crushes them).",
+    )
+    parser.add_argument(
+        "--shadow-bias",
+        type=float,
+        default=0.0,
+        help="0-1: weights --exposure/--gamma by the pixel's own luminance -- 0.0 applies "
+             "them uniformly (default); 1.0 applies their full effect in black, tapering to "
+             "none in white.",
+    )
     parser.add_argument("--out-texture", default=None, help="Optional corrected albedo path.")
     parser.add_argument(
         "--out-masks-dir",
@@ -1125,6 +1181,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         out_masks_dir=args.out_masks_dir,
         self_locality_radius=args.self_locality_radius,
         diffuse_color_override=args.diffuse_color,
+        exposure=args.exposure,
+        gamma=args.gamma,
+        shadow_bias=args.shadow_bias,
     )
 
 

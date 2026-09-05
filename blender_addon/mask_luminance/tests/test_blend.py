@@ -261,6 +261,38 @@ def test_flat_fill_covers_dark_painted_content_not_just_bright(repo_root, textur
     assert np.abs(working[dy, dx].astype(np.float32) - expected_target).max() < 5
 
 
+def test_mask_authoritative_ignores_luminance_delta_threshold():
+    """mask_authoritative=True must give full coverage even under-threshold.
+
+    Regression guard for blotchiness: a pixel whose luminance happens to
+    already be close to the diffuse target gets zero weight from the normal
+    luminance-delta ramp (dL=2 here, well under threshold=12) — leaving
+    speckles of the original pixel visible inside an otherwise "fully
+    covered" mask. mask_authoritative bypasses that ramp and trusts the
+    mask's own opacity directly, for both the flat_fill and normal paths.
+    """
+    working = np.full((10, 10, 3), 120, dtype=np.uint8)
+    diffuse_target = np.full((10, 10, 3), 118, dtype=np.float32)
+    mask_img = np.full((10, 10, 3), 255, dtype=np.uint8)
+    palette: dict = {}
+
+    for flat_fill in (True, False):
+        authoritative = core_blend.MaskChannel(
+            name="c", mask_path="unused", enabled=True, gate_mode="weight",
+            threshold=12.0, radius=0.0, flat_fill=flat_fill, mask_authoritative=True,
+        )
+        default = core_blend.MaskChannel(
+            name="c", mask_path="unused", enabled=True, gate_mode="weight",
+            threshold=12.0, radius=0.0, flat_fill=flat_fill, mask_authoritative=False,
+        )
+
+        soft_authoritative = core_blend.compute_channel_soft_mask(working, diffuse_target, mask_img, authoritative, palette)
+        soft_default = core_blend.compute_channel_soft_mask(working, diffuse_target, mask_img, default, palette)
+
+        assert np.all(soft_authoritative > 0.99), f"flat_fill={flat_fill}"
+        assert np.all(soft_default < 1e-6), f"flat_fill={flat_fill}"
+
+
 def test_process_arrays_matches_process_file_path_entry_point(repo_root, texture_path, feature_preserve_path, tmp_path):
     """The addon calls process_arrays() directly; it must agree with process()."""
     specs = _resolve_mask_paths(repo_root, CHANNEL_SPECS)
