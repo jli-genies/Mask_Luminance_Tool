@@ -639,13 +639,73 @@ class ProcessWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Main window
+# Shared path-row helper (module-level so other tabs can reuse it)
 # ---------------------------------------------------------------------------
-class MatteBlendWindow(QMainWindow):
+DEFAULT_IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.tif *.bmp);;All (*.*)"
+DEFAULT_SAVE_FILTER = "Images (*.png *.jpg *.jpeg *.tif);;All (*.*)"
+
+
+def _path_row(
+    form: QFormLayout,
+    label: str,
+    default: str,
+    root: str,
+    parent: QWidget,
+    save: bool = False,
+    invalidate: bool = False,
+    is_dir: bool = False,
+    on_change: Optional[Any] = None,
+    file_filter: Optional[str] = None,
+) -> QLineEdit:
+    row = QWidget()
+    hl = QHBoxLayout(row)
+    hl.setContentsMargins(0, 0, 0, 0)
+    edit = QLineEdit(default)
+    btn = QPushButton("…")
+    btn.setFixedWidth(32)
+    btn.clicked.connect(
+        lambda: _browse(
+            edit, root, parent, save=save, invalidate=invalidate, is_dir=is_dir,
+            on_change=on_change, file_filter=file_filter,
+        )
+    )
+    hl.addWidget(edit)
+    hl.addWidget(btn)
+    form.addRow(label, row)
+    if invalidate and on_change is not None:
+        edit.editingFinished.connect(on_change)
+    return edit
+
+
+def _browse(
+    edit: QLineEdit,
+    root: str,
+    parent: QWidget,
+    save: bool = False,
+    invalidate: bool = False,
+    is_dir: bool = False,
+    on_change: Optional[Any] = None,
+    file_filter: Optional[str] = None,
+) -> None:
+    start = edit.text().strip() or root
+    if is_dir:
+        path = QFileDialog.getExistingDirectory(parent, "Select directory", start)
+    elif save:
+        path, _ = QFileDialog.getSaveFileName(parent, "Save file", start, file_filter or DEFAULT_SAVE_FILTER)
+    else:
+        path, _ = QFileDialog.getOpenFileName(parent, "Open file", start, file_filter or DEFAULT_IMAGE_FILTER)
+    if path:
+        edit.setText(path)
+        if invalidate and on_change is not None:
+            on_change()
+
+
+# ---------------------------------------------------------------------------
+# Matte-blend tool panel (one page of the tabbed app)
+# ---------------------------------------------------------------------------
+class MatteBlendPanel(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Matte Luminance Blend")
-        self.resize(1450, 950)
         self._worker: Optional[ProcessWorker] = None
         self._job_id = 0
         self._pending_run: Optional[Tuple[dict, bool]] = None
@@ -658,9 +718,7 @@ class MatteBlendWindow(QMainWindow):
         self._debounce.setInterval(180)
         self._debounce.timeout.connect(self._run_live_preview)
 
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QHBoxLayout(central)
+        root = QHBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -852,36 +910,18 @@ class MatteBlendWindow(QMainWindow):
         invalidate: bool = False,
         is_dir: bool = False,
     ) -> QLineEdit:
-        row = QWidget()
-        hl = QHBoxLayout(row)
-        hl.setContentsMargins(0, 0, 0, 0)
-        edit = QLineEdit(default)
-        btn = QPushButton("…")
-        btn.setFixedWidth(32)
-        btn.clicked.connect(lambda: self._browse(edit, save=save, invalidate=invalidate, is_dir=is_dir))
-        hl.addWidget(edit)
-        hl.addWidget(btn)
-        form.addRow(label, row)
-        if invalidate:
-            edit.editingFinished.connect(self._on_inputs_changed)
-        return edit
-
-    def _browse(self, edit: QLineEdit, save: bool = False, invalidate: bool = False, is_dir: bool = False) -> None:
-        start = edit.text().strip() or self._root
-        if is_dir:
-            path = QFileDialog.getExistingDirectory(self, "Select directory", start)
-        elif save:
-            path, _ = QFileDialog.getSaveFileName(
-                self, "Save image", start, "Images (*.png *.jpg *.jpeg *.tif);;All (*.*)"
-            )
-        else:
-            path, _ = QFileDialog.getOpenFileName(
-                self, "Open image", start, "Images (*.png *.jpg *.jpeg *.tif *.bmp);;All (*.*)"
-            )
-        if path:
-            edit.setText(path)
-            if invalidate:
-                self._on_inputs_changed()
+        """Thin forwarder to the module-level ``_path_row`` (shared with other tabs)."""
+        return _path_row(
+            form,
+            label,
+            default,
+            root=self._root,
+            parent=self,
+            save=save,
+            invalidate=invalidate,
+            is_dir=is_dir,
+            on_change=self._on_inputs_changed if invalidate else None,
+        )
 
     def _seed_default_paths(self) -> None:
         pass
@@ -1019,9 +1059,26 @@ class MatteBlendWindow(QMainWindow):
             self._start_job(params, write_outputs)
 
 
+# ---------------------------------------------------------------------------
+# Top-level tabbed app window
+# ---------------------------------------------------------------------------
+class AppWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Mask Luminance Tool")
+        self.resize(1450, 950)
+
+        from multiview_feature_tab import MultiviewFeatureTab
+
+        tabs = QTabWidget()
+        tabs.addTab(MatteBlendPanel(), "Matte Blend")
+        tabs.addTab(MultiviewFeatureTab(), "Multiview Feature Bake")
+        self.setCentralWidget(tabs)
+
+
 def main() -> None:
     app = QApplication(sys.argv)
-    win = MatteBlendWindow()
+    win = AppWindow()
     win.show()
     sys.exit(app.exec())
 
