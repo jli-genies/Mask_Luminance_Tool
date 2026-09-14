@@ -133,6 +133,17 @@ class MaskChannel:
             branches. Fixes blotchy partial coverage inside a hand-painted
             mask whose pixels don't happen to differ much in luminance from
             the diffuse target.
+        fill_from_own_mask: Only meaningful when ``flat_fill`` is set.
+            Instead of filling with the shared clean-skin color every
+            ``flat_fill`` channel draws from by default (the mean of the
+            sample's own pixels outside every enabled channel's gate — see
+            ``build_local_diffuse_target(..., flat=True)``), fill with the
+            mean of the sample's own pixels *inside this channel's own
+            mask* (see ``estimate_own_mask_color``). Lets one channel (e.g.
+            a highlight) use its own tint instead of matching whatever
+            other flat_fill channels (e.g. a shadow) already use, so the two
+            read as visibly different colors rather than the same shared
+            fill.
     """
 
     name: str
@@ -152,6 +163,7 @@ class MaskChannel:
     blend_weight: float = 1.0
     flat_fill: bool = False
     mask_authoritative: bool = False
+    fill_from_own_mask: bool = False
 
     def __post_init__(self) -> None:
         if self.gate_mode not in GATE_MODES:
@@ -345,6 +357,33 @@ def estimate_diffuse_color(
             "masks or use --diffuse-mode uv/palette instead."
         )
     return sample.astype(np.float32)[valid].mean(axis=0)
+
+
+def estimate_own_mask_color(
+    sample: np.ndarray,
+    gate: np.ndarray,
+    bg_threshold: float = 8.0,
+) -> np.ndarray:
+    """Mean RGB (float32, shape (3,)) of ``sample``'s pixels *inside* ``gate``.
+
+    The mirror image of ``estimate_diffuse_color`` (which averages outside
+    every mask): this is what ``MaskChannel.fill_from_own_mask`` uses so a
+    flat_fill channel can be tinted from what its own mask actually covers
+    (e.g. a highlight mask's own brightened area) instead of the shared
+    clean-skin color every other flat_fill channel draws from. Weighted by
+    ``gate`` itself so partially-covered (soft/feathered) pixels contribute
+    proportionally rather than all-or-nothing.
+    """
+    lum = luminance(sample)
+    valid = (lum > bg_threshold) & (gate > 1e-3)
+    if not np.any(valid):
+        raise ValueError(
+            "Could not estimate this channel's own-mask color: its gate has "
+            "no coverage over non-background pixels."
+        )
+    w = gate[valid].astype(np.float32)
+    px = sample.astype(np.float32)[valid]
+    return (px * w[:, None]).sum(axis=0) / w.sum()
 
 
 def resolve_diffuse_color(
@@ -778,6 +817,7 @@ def apply_mask_channel(
     luminance_only: bool = True,
     feature_preserve: Optional[np.ndarray] = None,
     flat_target: Optional[np.ndarray] = None,
+    own_mask_target: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Runs one mask channel's full pass: gate -> threshold -> feather -> correct.
 
@@ -789,12 +829,19 @@ def apply_mask_channel(
     feature whose color differs in hue rather than brightness (lips, tinted
     brows) would keep showing through its original color no matter how
     opaque the mask is or how high ``strength`` is set — defeating the point
-    of a *flat* fill, which needs to replace hue too.
+    of a *flat* fill, which needs to replace hue too. ``own_mask_target``
+    (required if ``channel.fill_from_own_mask``) takes priority over
+    ``flat_target`` when both are set — see ``MaskChannel.fill_from_own_mask``.
 
     Returns the updated working texture and the channel's soft weight mask
     (post-feather, pre-strength — useful for debug output).
     """
-    target = flat_target if (channel.flat_fill and flat_target is not None) else diffuse_target
+    if channel.flat_fill and channel.fill_from_own_mask and own_mask_target is not None:
+        target = own_mask_target
+    elif channel.flat_fill and flat_target is not None:
+        target = flat_target
+    else:
+        target = diffuse_target
     diffuse_mix = 1.0 if channel.flat_fill else channel.diffuse_mix
     effective_luminance_only = False if channel.flat_fill else luminance_only
 
@@ -855,6 +902,7 @@ def apply_blend_group(
     luminance_only: bool = True,
     feature_preserve: Optional[np.ndarray] = None,
     flat_target: Optional[np.ndarray] = None,
+    own_mask_targets: Optional[Dict[str, np.ndarray]] = None,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """Blends several channels' independent corrections into one result.
 
@@ -865,14 +913,22 @@ def apply_blend_group(
     ``composite_correction_targets``, weighted by each channel's own coverage
     (soft mask * strength * blend_weight), so individual per-channel control
     is preserved everywhere except the overlap, which blends smoothly instead
-    of one channel hard-overwriting the other.
+    of one channel hard-overwriting the other. ``own_mask_targets`` (keyed by
+    channel name) overrides ``flat_target`` per-channel for any member with
+    ``fill_from_own_mask`` set — see ``MaskChannel.fill_from_own_mask``.
     """
     targets: List[np.ndarray] = []
     weights: List[np.ndarray] = []
     soft_masks: Dict[str, np.ndarray] = {}
 
     for ch in group_channels:
-        ch_target = flat_target if (ch.flat_fill and flat_target is not None) else diffuse_target
+        ch_own_target = (own_mask_targets or {}).get(ch.name)
+        if ch.flat_fill and ch.fill_from_own_mask and ch_own_target is not None:
+            ch_target = ch_own_target
+        elif ch.flat_fill and flat_target is not None:
+            ch_target = flat_target
+        else:
+            ch_target = diffuse_target
         ch_diffuse_mix = 1.0 if ch.flat_fill else ch.diffuse_mix
 
         soft = compute_channel_soft_mask(working, ch_target, mask_imgs[ch.name], ch, palette, feature_preserve)
@@ -905,6 +961,7 @@ def run_channel_pipeline(
     luminance_only: bool = True,
     feature_preserve: Optional[np.ndarray] = None,
     flat_target: Optional[np.ndarray] = None,
+    own_mask_targets: Optional[Dict[str, np.ndarray]] = None,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """Runs every enabled channel over ``working``, in order.
 
@@ -913,8 +970,10 @@ def run_channel_pipeline(
     name are instead run together through ``apply_blend_group`` the first
     time any of them is reached, so their results blend by coverage instead
     of overwriting each other. ``flat_target`` (see ``MaskChannel.flat_fill``)
-    is only used by channels that opt into it. Returns the final texture and
-    each channel's soft mask (for debug output).
+    is only used by channels that opt into it, and ``own_mask_targets``
+    (keyed by channel name, see ``MaskChannel.fill_from_own_mask``) overrides
+    it per-channel where set. Returns the final texture and each channel's
+    soft mask (for debug output).
     """
     working = working.copy()
     channel_masks: Dict[str, np.ndarray] = {}
@@ -928,7 +987,7 @@ def run_channel_pipeline(
             group_members = [c for c in active_channels if c.blend_group == ch.blend_group]
             working, group_soft = apply_blend_group(
                 working, diffuse_target, mask_imgs, group_members, palette, luminance_only, feature_preserve,
-                flat_target,
+                flat_target, own_mask_targets,
             )
             channel_masks.update(group_soft)
             logger.info(
@@ -937,7 +996,7 @@ def run_channel_pipeline(
         else:
             working, soft = apply_mask_channel(
                 working, diffuse_target, mask_imgs[ch.name], ch, palette, luminance_only, feature_preserve,
-                flat_target,
+                flat_target, (own_mask_targets or {}).get(ch.name),
             )
             channel_masks[ch.name] = soft
             logger.info(
@@ -1026,8 +1085,16 @@ def process(
         else:
             flat_target = build_local_diffuse_target(sample, exclude, self_locality_radius, flat=True)
 
+    own_mask_targets: Dict[str, np.ndarray] = {}
+    for ch in active:
+        if ch.flat_fill and ch.fill_from_own_mask:
+            gate = compute_channel_gate(mask_imgs[ch.name], ch, palette)
+            color = estimate_own_mask_color(sample, gate)
+            own_mask_targets[ch.name] = np.broadcast_to(color, sample.shape).astype(np.float32).copy()
+
     working, channel_masks = run_channel_pipeline(
         sample, diffuse_target, mask_imgs, active, palette, luminance_only, feature_preserve, flat_target,
+        own_mask_targets,
     )
 
     if exposure != 0.0 or gamma != 1.0 or shadow_bias != 0.0:

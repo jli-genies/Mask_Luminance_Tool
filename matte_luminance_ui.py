@@ -51,6 +51,7 @@ from matte_luminance_blend import (
     build_local_diffuse_target,
     compute_channel_gate,
     composite_weights,
+    estimate_own_mask_color,
     load_rgb,
     make_diffuse_target,
     resize_to,
@@ -374,6 +375,8 @@ class ChannelPanel(QGroupBox):
 
     changed = pyqtSignal()
     removeRequested = pyqtSignal(object)
+    moveUpRequested = pyqtSignal(object)
+    moveDownRequested = pyqtSignal(object)
 
     def __init__(self, name: str, mask_path: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(name, parent)
@@ -427,7 +430,7 @@ class ChannelPanel(QGroupBox):
         form.addRow("Region tolerance", self.region_tolerance)
 
         self.threshold = _SliderSpin(0.0, 80.0, 12.0, step=0.5, decimals=1, slider_scale=10)
-        self.radius = _SliderSpin(0.0, 64.0, 8.0, step=0.5, decimals=1, slider_scale=10)
+        self.radius = _SliderSpin(0.0, 200.0, 8.0, step=0.5, decimals=1, slider_scale=10)
         self.strength = _SliderSpin(0.0, 1.0, 0.85, step=0.01, decimals=2, slider_scale=100)
         self.diffuse_mix = _SliderSpin(0.0, 1.0, 0.0, step=0.01, decimals=2, slider_scale=100)
         form.addRow("Threshold (dL)", self.threshold)
@@ -444,6 +447,15 @@ class ChannelPanel(QGroupBox):
         self.flat_fill = QCheckBox("Flat fill (mean skin color instead of infill/blur)")
         form.addRow(self.flat_fill)
 
+        self.fill_from_own_mask = QCheckBox("Fill color from this mask's own average (not shared skin color)")
+        self.fill_from_own_mask.setToolTip(
+            "Only used when Flat fill is on. Instead of the shared clean-skin color every "
+            "other flat-fill channel draws from, tint the fill with the mean color of the "
+            "sample's own pixels under THIS channel's mask — e.g. a highlight mask filling "
+            "with its own (brighter) average instead of matching a shadow channel's fill."
+        )
+        form.addRow(self.fill_from_own_mask)
+
         self.mask_authoritative = QCheckBox("Mask authoritative (use mask opacity directly)")
         self.mask_authoritative.setToolTip(
             "Skip the luminance-difference threshold and trust this mask's own painted "
@@ -458,6 +470,25 @@ class ChannelPanel(QGroupBox):
         self.blend_weight = _SliderSpin(0.0, 5.0, 1.0, step=0.05, decimals=2, slider_scale=100)
         form.addRow("Blend weight (within group)", self.blend_weight)
 
+        order_row = QWidget()
+        orl = QHBoxLayout(order_row)
+        orl.setContentsMargins(0, 0, 0, 0)
+        move_up_btn = QPushButton("▲ Move up")
+        move_down_btn = QPushButton("▼ Move down")
+        move_up_btn.setToolTip(
+            "Move this channel earlier in the processing order, so later channels "
+            "(further down the list) layer on top of it wherever masks overlap."
+        )
+        move_down_btn.setToolTip(
+            "Move this channel later in the processing order, so it layers on top "
+            "of earlier channels wherever masks overlap."
+        )
+        move_up_btn.clicked.connect(lambda: self.moveUpRequested.emit(self))
+        move_down_btn.clicked.connect(lambda: self.moveDownRequested.emit(self))
+        orl.addWidget(move_up_btn)
+        orl.addWidget(move_down_btn)
+        form.addRow(order_row)
+
         remove_btn = QPushButton("Remove channel")
         remove_btn.clicked.connect(lambda: self.removeRequested.emit(self))
         form.addRow(remove_btn)
@@ -466,7 +497,7 @@ class ChannelPanel(QGroupBox):
         for w in (self.threshold, self.radius, self.strength, self.diffuse_mix, self.region_tolerance, self.blend_weight):
             w.valueChanged.connect(lambda *_: self.changed.emit())
         for cb in (self.use_infill, self.spill_outside, self.fill_holes, self.flat_fill,
-                   self.mask_authoritative, *self.region_checks.values()):
+                   self.mask_authoritative, self.fill_from_own_mask, *self.region_checks.values()):
             cb.toggled.connect(lambda *_: self.changed.emit())
         self.flat_fill.toggled.connect(self._on_flat_fill_toggled)
         self.mask_type.currentTextChanged.connect(self._on_mask_type_changed)
@@ -491,6 +522,7 @@ class ChannelPanel(QGroupBox):
         self.diffuse_mix.setVisible(not on)
         self.use_infill.setVisible(not on)
         self.spill_outside.setVisible(not on)
+        self.fill_from_own_mask.setVisible(on)
         self.changed.emit()
 
     def _on_mask_type_changed(self, label: str) -> None:
@@ -547,6 +579,7 @@ class ChannelPanel(QGroupBox):
             blend_weight=self.blend_weight.value(),
             flat_fill=self.flat_fill.isChecked(),
             mask_authoritative=self.mask_authoritative.isChecked(),
+            fill_from_own_mask=self.fill_from_own_mask.isChecked(),
         )
 
     def to_preset_dict(self) -> dict:
@@ -568,6 +601,7 @@ class ChannelPanel(QGroupBox):
             "spill_outside": self.spill_outside.isChecked(),
             "flat_fill": self.flat_fill.isChecked(),
             "mask_authoritative": self.mask_authoritative.isChecked(),
+            "fill_from_own_mask": self.fill_from_own_mask.isChecked(),
             "blend_group": self.blend_group.text().strip(),
             "blend_weight": self.blend_weight.value(),
         }
@@ -619,6 +653,9 @@ class ChannelPanel(QGroupBox):
             self.flat_fill.setChecked(bool(data.get("flat_fill", self.flat_fill.isChecked())))
             self.mask_authoritative.setChecked(
                 bool(data.get("mask_authoritative", self.mask_authoritative.isChecked()))
+            )
+            self.fill_from_own_mask.setChecked(
+                bool(data.get("fill_from_own_mask", self.fill_from_own_mask.isChecked()))
             )
             self.blend_group.setText(data.get("blend_group") or "")
         finally:
@@ -678,6 +715,13 @@ def _process_texture(params: dict, write_outputs: bool) -> Dict[str, Any]:
         else:
             flat_target = build_local_diffuse_target(sample, exclude, p["self_locality_radius"], flat=True)
 
+    own_mask_targets: Dict[str, np.ndarray] = {}
+    for ch in active:
+        if ch.flat_fill and ch.fill_from_own_mask:
+            gate = compute_channel_gate(mask_imgs[ch.name], ch, palette)
+            color = estimate_own_mask_color(sample, gate)
+            own_mask_targets[ch.name] = np.broadcast_to(color, sample.shape).astype(np.float32).copy()
+
     if diffuse_color_override is not None:
         diffuse_color = np.asarray(diffuse_color_override, dtype=np.float32)
     else:
@@ -685,6 +729,7 @@ def _process_texture(params: dict, write_outputs: bool) -> Dict[str, Any]:
 
     working, soft_masks = run_channel_pipeline(
         sample, diffuse_target, mask_imgs, active, palette, p["luminance_only"], feature_preserve, flat_target,
+        own_mask_targets,
     )
 
     exposure, gamma, shadow_bias = p["exposure"], p["gamma"], p["shadow_bias"]
@@ -1244,6 +1289,8 @@ class MatteBlendPanel(QWidget):
         panel = ChannelPanel(name, mask_path)
         panel.changed.connect(self._schedule_live_preview)
         panel.removeRequested.connect(self._remove_channel_panel)
+        panel.moveUpRequested.connect(lambda p: self._move_channel_panel(p, -1))
+        panel.moveDownRequested.connect(lambda p: self._move_channel_panel(p, 1))
         # Insert above the "Add mask…" button, which is always the last item.
         self.channels_layout.insertWidget(self.channels_layout.count() - 1, panel)
         self._channel_panels.append(panel)
@@ -1252,6 +1299,24 @@ class MatteBlendPanel(QWidget):
         self._channel_panels.remove(panel)
         self.channels_layout.removeWidget(panel)
         panel.deleteLater()
+        self._schedule_live_preview()
+
+    def _move_channel_panel(self, panel: ChannelPanel, direction: int) -> None:
+        """Reorders ``panel`` by one slot; later slots are applied later, i.e. layer
+
+        on top of earlier ones wherever their masks overlap (see
+        ``run_channel_pipeline``).
+        """
+        idx = self._channel_panels.index(panel)
+        new_idx = idx + direction
+        if not (0 <= new_idx < len(self._channel_panels)):
+            return
+        self._channel_panels[idx], self._channel_panels[new_idx] = (
+            self._channel_panels[new_idx],
+            self._channel_panels[idx],
+        )
+        self.channels_layout.removeWidget(panel)
+        self.channels_layout.insertWidget(new_idx, panel)
         self._schedule_live_preview()
 
     # -- live preview wiring -------------------------------------------------
