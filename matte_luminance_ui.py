@@ -8,6 +8,7 @@ Run::
 from __future__ import annotations
 
 import glob
+import json
 import os
 import sys
 import traceback
@@ -27,6 +28,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -65,11 +67,14 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 # Helpers
 # ---------------------------------------------------------------------------
 def _rgb_to_qpixmap(rgb: np.ndarray) -> QPixmap:
-    """Convert uint8 RGB (or gray) numpy array to a full-resolution QPixmap."""
+    """Convert uint8 RGB/RGBA (or gray) numpy array to a full-resolution QPixmap."""
     arr = np.ascontiguousarray(np.clip(rgb, 0, 255).astype(np.uint8))
     if arr.ndim == 2:
         h, w = arr.shape
         qimg = QImage(arr.data, w, h, w, QImage.Format.Format_Grayscale8).copy()
+    elif arr.shape[2] == 4:
+        h, w, _ = arr.shape
+        qimg = QImage(arr.data, w, h, 4 * w, QImage.Format.Format_RGBA8888).copy()
     else:
         h, w, _ = arr.shape
         qimg = QImage(arr.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
@@ -209,6 +214,16 @@ class DiffuseColorRow(QWidget):
 
     def override_color(self) -> Optional[Tuple[float, float, float]]:
         return self._color if self.is_override_enabled() else None
+
+    def stored_color(self) -> Tuple[float, float, float]:
+        """Raw color, whether or not override is currently enabled — for presets."""
+        return self._color
+
+    def set_preset_state(self, enabled: bool, color: Optional[Tuple[float, float, float]]) -> None:
+        if color is not None:
+            self._color = (float(color[0]), float(color[1]), float(color[2]))
+            self._update_swatch()
+        self.override_check.setChecked(enabled)
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +549,175 @@ class ChannelPanel(QGroupBox):
             mask_authoritative=self.mask_authoritative.isChecked(),
         )
 
+    def to_preset_dict(self) -> dict:
+        """Full UI state for this channel (name/mask path included) — for presets."""
+        return {
+            "name": self.title(),
+            "mask_path": self.mask_path(),
+            "enabled": self.isChecked(),
+            "mask_type": self.mask_type.currentText(),
+            "gate_mode": self.gate_mode.currentText(),
+            "fill_holes": self.fill_holes.isChecked(),
+            "regions": {n: cb.isChecked() for n, cb in self.region_checks.items()},
+            "region_tolerance": self.region_tolerance.value(),
+            "threshold": self.threshold.value(),
+            "radius": self.radius.value(),
+            "strength": self.strength.value(),
+            "diffuse_mix": self.diffuse_mix.value(),
+            "use_infill": self.use_infill.isChecked(),
+            "spill_outside": self.spill_outside.isChecked(),
+            "flat_fill": self.flat_fill.isChecked(),
+            "mask_authoritative": self.mask_authoritative.isChecked(),
+            "blend_group": self.blend_group.text().strip(),
+            "blend_weight": self.blend_weight.value(),
+        }
+
+    def apply_preset_dict(self, data: dict) -> None:
+        """Restores UI state saved by ``to_preset_dict``.
+
+        Signals are blocked while applying so intermediate widget updates don't
+        each trigger a live-preview re-run, and so the "Mask type" combo's own
+        one-shot preset logic (``_on_mask_type_changed``) doesn't clobber the
+        explicit values we're about to set — the panel emits a single
+        ``changed`` at the end instead.
+        """
+        self.blockSignals(True)
+        try:
+            self.mask_edit.setText(data.get("mask_path", self.mask_path()))
+            self.setChecked(bool(data.get("enabled", self.isChecked())))
+
+            mask_type = data.get("mask_type")
+            if mask_type is not None:
+                self.mask_type.blockSignals(True)
+                self.mask_type.setCurrentText(mask_type)
+                self.mask_type.blockSignals(False)
+
+            gate_mode = data.get("gate_mode")
+            if gate_mode is not None:
+                self.gate_mode.setCurrentText(gate_mode)
+
+            self.fill_holes.setChecked(bool(data.get("fill_holes", self.fill_holes.isChecked())))
+
+            regions = data.get("regions")
+            if regions:
+                for rname, cb in self.region_checks.items():
+                    cb.setChecked(bool(regions.get(rname, cb.isChecked())))
+
+            for key, widget in (
+                ("region_tolerance", self.region_tolerance),
+                ("threshold", self.threshold),
+                ("radius", self.radius),
+                ("strength", self.strength),
+                ("diffuse_mix", self.diffuse_mix),
+                ("blend_weight", self.blend_weight),
+            ):
+                if key in data:
+                    widget.setValue(data[key])
+
+            self.use_infill.setChecked(bool(data.get("use_infill", self.use_infill.isChecked())))
+            self.spill_outside.setChecked(bool(data.get("spill_outside", self.spill_outside.isChecked())))
+            self.flat_fill.setChecked(bool(data.get("flat_fill", self.flat_fill.isChecked())))
+            self.mask_authoritative.setChecked(
+                bool(data.get("mask_authoritative", self.mask_authoritative.isChecked()))
+            )
+            self.blend_group.setText(data.get("blend_group") or "")
+        finally:
+            self.blockSignals(False)
+
+        # Re-apply visibility rules that depend on gate_mode / flat_fill (normally
+        # driven by their toggled/changed signals, which were blocked above).
+        self._on_gate_mode_changed(self.gate_mode.currentText())
+        self._on_flat_fill_toggled(self.flat_fill.isChecked())
+        self.changed.emit()
+
+
+def _process_texture(params: dict, write_outputs: bool) -> Dict[str, Any]:
+    """Runs the matte-blend pipeline for one texture. Shared by ``ProcessWorker`` (single-file /
+    live preview) and ``BatchWorker`` (many files, same settings) so the pipeline logic lives
+    in exactly one place.
+    """
+    p = params
+    sample: np.ndarray = p["sample"]
+    channels: List[MaskChannel] = p["channels"]
+    active = [ch for ch in channels if ch.enabled]
+
+    mask_imgs: Dict[str, np.ndarray] = {}
+    for ch in active:
+        nearest = ch.gate_mode in ("blue_paint", "color_id")
+        mask_imgs[ch.name] = resize_to(load_rgb(ch.mask_path), sample.shape[:2], nearest=nearest)
+
+    feature_preserve = None
+    if p["feature_preserve_path"]:
+        feature_preserve = composite_weights(
+            resize_to(load_rgb(p["feature_preserve_path"]), sample.shape[:2], nearest=False)
+        )
+
+    palette = DEFAULT_REGION_PALETTE
+    exclude = np.zeros(sample.shape[:2], dtype=np.float32)
+    for ch in active:
+        exclude = np.maximum(exclude, compute_channel_gate(mask_imgs[ch.name], ch, palette))
+    if feature_preserve is not None:
+        exclude = np.maximum(exclude, feature_preserve)
+
+    diffuse_color_override = p.get("diffuse_color_override")
+    diffuse_img = None
+    if diffuse_color_override is not None:
+        diffuse_target = np.broadcast_to(
+            np.asarray(diffuse_color_override, dtype=np.float32), sample.shape
+        ).copy()
+    elif p["diffuse_mode"] == "self":
+        diffuse_target = build_local_diffuse_target(sample, exclude, p["self_locality_radius"])
+    else:
+        diffuse_img = load_rgb(p["diffuse_path"])
+        diffuse_target = make_diffuse_target(sample, diffuse_img, p["diffuse_mode"])
+
+    flat_target = None
+    if any(ch.flat_fill for ch in active):
+        if diffuse_color_override is not None:
+            flat_target = diffuse_target
+        else:
+            flat_target = build_local_diffuse_target(sample, exclude, p["self_locality_radius"], flat=True)
+
+    if diffuse_color_override is not None:
+        diffuse_color = np.asarray(diffuse_color_override, dtype=np.float32)
+    else:
+        diffuse_color = resolve_diffuse_color(sample, p["diffuse_mode"], exclude, diffuse_img)
+
+    working, soft_masks = run_channel_pipeline(
+        sample, diffuse_target, mask_imgs, active, palette, p["luminance_only"], feature_preserve, flat_target,
+    )
+
+    exposure, gamma, shadow_bias = p["exposure"], p["gamma"], p["shadow_bias"]
+    if exposure != 0.0 or gamma != 1.0 or shadow_bias != 0.0:
+        working = apply_exposure_gamma(working, exposure=exposure, gamma=gamma, shadow_bias=shadow_bias)
+
+    channel_masks = {
+        name: np.clip(soft * 255.0, 0, 255).astype(np.uint8) for name, soft in soft_masks.items()
+    }
+
+    result: Dict[str, Any] = {
+        "texture": working,
+        "sample": sample,
+        "channel_masks": channel_masks,
+        "diffuse_color": diffuse_color,
+    }
+
+    if write_outputs:
+        out_tex = p["out_texture_path"]
+        out_dir = p["out_masks_dir"]
+        os.makedirs(os.path.dirname(out_tex) or ".", exist_ok=True)
+        save_rgb(out_tex, working)
+        paths = {"texture": out_tex}
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+            for name, mask_u8 in channel_masks.items():
+                mp = os.path.join(out_dir, f"{name}_mask.png")
+                save_rgb(mp, mask_u8)
+                paths[f"mask:{name}"] = mp
+        result["paths"] = paths
+
+    return result
+
 
 class ProcessWorker(QThread):
     finished_ok = pyqtSignal(int, dict)  # job_id, result
@@ -553,89 +737,56 @@ class ProcessWorker(QThread):
 
     def run(self) -> None:
         try:
-            p = self.params
-            sample: np.ndarray = p["sample"]
-            channels: List[MaskChannel] = p["channels"]
-            active = [ch for ch in channels if ch.enabled]
-
-            mask_imgs: Dict[str, np.ndarray] = {}
-            for ch in active:
-                nearest = ch.gate_mode in ("blue_paint", "color_id")
-                mask_imgs[ch.name] = resize_to(load_rgb(ch.mask_path), sample.shape[:2], nearest=nearest)
-
-            feature_preserve = None
-            if p["feature_preserve_path"]:
-                feature_preserve = composite_weights(
-                    resize_to(load_rgb(p["feature_preserve_path"]), sample.shape[:2], nearest=False)
-                )
-
-            palette = DEFAULT_REGION_PALETTE
-            exclude = np.zeros(sample.shape[:2], dtype=np.float32)
-            for ch in active:
-                exclude = np.maximum(exclude, compute_channel_gate(mask_imgs[ch.name], ch, palette))
-            if feature_preserve is not None:
-                exclude = np.maximum(exclude, feature_preserve)
-
-            diffuse_color_override = p.get("diffuse_color_override")
-            diffuse_img = None
-            if diffuse_color_override is not None:
-                diffuse_target = np.broadcast_to(
-                    np.asarray(diffuse_color_override, dtype=np.float32), sample.shape
-                ).copy()
-            elif p["diffuse_mode"] == "self":
-                diffuse_target = build_local_diffuse_target(sample, exclude, p["self_locality_radius"])
-            else:
-                diffuse_img = load_rgb(p["diffuse_path"])
-                diffuse_target = make_diffuse_target(sample, diffuse_img, p["diffuse_mode"])
-
-            flat_target = None
-            if any(ch.flat_fill for ch in active):
-                if diffuse_color_override is not None:
-                    flat_target = diffuse_target
-                else:
-                    flat_target = build_local_diffuse_target(sample, exclude, p["self_locality_radius"], flat=True)
-
-            if diffuse_color_override is not None:
-                diffuse_color = np.asarray(diffuse_color_override, dtype=np.float32)
-            else:
-                diffuse_color = resolve_diffuse_color(sample, p["diffuse_mode"], exclude, diffuse_img)
-
-            working, soft_masks = run_channel_pipeline(
-                sample, diffuse_target, mask_imgs, active, palette, p["luminance_only"], feature_preserve, flat_target,
-            )
-
-            exposure, gamma, shadow_bias = p["exposure"], p["gamma"], p["shadow_bias"]
-            if exposure != 0.0 or gamma != 1.0 or shadow_bias != 0.0:
-                working = apply_exposure_gamma(working, exposure=exposure, gamma=gamma, shadow_bias=shadow_bias)
-
-            channel_masks = {
-                name: np.clip(soft * 255.0, 0, 255).astype(np.uint8) for name, soft in soft_masks.items()
-            }
-
-            result: Dict[str, Any] = {
-                "texture": working,
-                "sample": sample,
-                "channel_masks": channel_masks,
-                "diffuse_color": diffuse_color,
-            }
-
-            if self.write_outputs:
-                out_tex = p["out_texture_path"]
-                out_dir = p["out_masks_dir"]
-                os.makedirs(os.path.dirname(out_tex) or ".", exist_ok=True)
-                save_rgb(out_tex, working)
-                paths = {"texture": out_tex}
-                if out_dir:
-                    os.makedirs(out_dir, exist_ok=True)
-                    for name, mask_u8 in channel_masks.items():
-                        mp = os.path.join(out_dir, f"{name}_mask.png")
-                        save_rgb(mp, mask_u8)
-                        paths[f"mask:{name}"] = mp
-                result["paths"] = paths
-
+            result = _process_texture(self.params, self.write_outputs)
             self.finished_ok.emit(self.job_id, result)
         except Exception:
             self.failed.emit(self.job_id, traceback.format_exc())
+
+
+class BatchWorker(QThread):
+    """Runs ``_process_texture`` for many input files under one fixed settings template.
+
+    One bad file does not abort the run — failures are collected and reported at the end.
+    """
+
+    fileDone = pyqtSignal(int, int, str)  # index, total, filename
+    fileFailed = pyqtSignal(int, int, str, str)  # index, total, filename, error
+    batchFinished = pyqtSignal(int, int, list)  # ok_count, total, failures[(filename, error)]
+
+    def __init__(
+        self,
+        input_paths: List[str],
+        output_dir: str,
+        base_params: dict,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.input_paths = input_paths
+        self.output_dir = output_dir
+        self.base_params = base_params
+
+    def run(self) -> None:
+        total = len(self.input_paths)
+        ok_count = 0
+        failures: List[Tuple[str, str]] = []
+        for i, path in enumerate(self.input_paths, start=1):
+            name = os.path.basename(path)
+            try:
+                params = dict(self.base_params)
+                params["sample"] = load_rgb(path)
+                params["out_texture_path"] = os.path.join(self.output_dir, name)
+                if params.get("out_masks_dir"):
+                    stem = os.path.splitext(name)[0]
+                    params["out_masks_dir"] = os.path.join(self.output_dir, "channel_masks", stem)
+                _process_texture(params, write_outputs=True)
+                ok_count += 1
+                self.fileDone.emit(i, total, name)
+            except Exception:
+                err = traceback.format_exc()
+                failures.append((name, err))
+                print(f"[batch] failed on {name}:\n{err}")
+                self.fileFailed.emit(i, total, name, err)
+        self.batchFinished.emit(ok_count, total, failures)
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +851,57 @@ def _browse(
             on_change()
 
 
+def list_images(folder: str) -> List[str]:
+    """Sorted list of image files directly inside ``folder`` (matching ``IMAGE_EXTS``)."""
+    found: List[str] = []
+    for ext in IMAGE_EXTS:
+        found.extend(glob.glob(os.path.join(folder, f"*{ext}")))
+    return sorted(found)
+
+
+# ---------------------------------------------------------------------------
+# Shared batch-run bar: input folder + output folder + run button + status.
+# Embedded by both MatteBlendPanel and SegmentPanel (multiview_feature_tab.py).
+# ---------------------------------------------------------------------------
+class BatchBar(QGroupBox):
+    runRequested = pyqtSignal()
+
+    def __init__(self, root: str, run_label: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__("Batch", parent)
+        self._root = root
+
+        form = QFormLayout(self)
+        self.input_edit = _path_row(
+            form, "Input folder", "", root=root, parent=self, is_dir=True
+        )
+        self.output_edit = _path_row(
+            form, "Output folder", os.path.join(root, "output", "batch"), root=root, parent=self, is_dir=True
+        )
+
+        self.run_btn = QPushButton(run_label)
+        self.run_btn.setMinimumHeight(32)
+        self.run_btn.clicked.connect(self.runRequested.emit)
+        form.addRow(self.run_btn)
+
+        self.status = QLabel("Ready.")
+        self.status.setWordWrap(True)
+        form.addRow(self.status)
+
+    def input_dir(self) -> str:
+        return self.input_edit.text().strip()
+
+    def output_dir(self) -> str:
+        return self.output_edit.text().strip()
+
+    def set_running(self, running: bool) -> None:
+        self.run_btn.setEnabled(not running)
+        self.input_edit.setEnabled(not running)
+        self.output_edit.setEnabled(not running)
+
+    def set_status(self, text: str) -> None:
+        self.status.setText(text)
+
+
 # ---------------------------------------------------------------------------
 # Matte-blend tool panel (one page of the tabbed app)
 # ---------------------------------------------------------------------------
@@ -710,7 +912,9 @@ class MatteBlendPanel(QWidget):
         self._job_id = 0
         self._pending_run: Optional[Tuple[dict, bool]] = None
         self._sample_cache: Optional[Tuple[str, np.ndarray]] = None
+        self._batch_worker: Optional[BatchWorker] = None
         self._root = os.path.dirname(os.path.abspath(__file__))
+        self._presets_dir = os.path.join(self._root, "presets")
         self._channel_panels: List[ChannelPanel] = []
 
         self._debounce = QTimer(self)
@@ -741,6 +945,28 @@ class MatteBlendPanel(QWidget):
         controls_scroll.setWidget(controls_inner)
         ch_layout.addWidget(controls_scroll)
         splitter.addWidget(controls_host)
+
+        # --- Presets ----------------------------------------------------------
+        presets_box = QGroupBox("Presets")
+        ppf = QFormLayout(presets_box)
+        self.preset_combo = QComboBox()
+        ppf.addRow("Preset", self.preset_combo)
+
+        preset_btn_row = QWidget()
+        pbl = QHBoxLayout(preset_btn_row)
+        pbl.setContentsMargins(0, 0, 0, 0)
+        self.preset_load_btn = QPushButton("Load")
+        self.preset_save_btn = QPushButton("Save…")
+        self.preset_delete_btn = QPushButton("Delete")
+        self.preset_refresh_btn = QPushButton("Refresh")
+        for b in (self.preset_load_btn, self.preset_save_btn, self.preset_delete_btn, self.preset_refresh_btn):
+            pbl.addWidget(b)
+        ppf.addRow(preset_btn_row)
+        self.preset_load_btn.clicked.connect(self._on_load_preset)
+        self.preset_save_btn.clicked.connect(self._on_save_preset)
+        self.preset_delete_btn.clicked.connect(self._on_delete_preset)
+        self.preset_refresh_btn.clicked.connect(self._refresh_preset_list)
+        self._controls_layout.addWidget(presets_box)
 
         # --- Inputs ---------------------------------------------------------
         io_box = QGroupBox("Inputs")
@@ -815,6 +1041,11 @@ class MatteBlendPanel(QWidget):
         self.run_btn.clicked.connect(self._on_process)
         self._controls_layout.addWidget(self.run_btn)
 
+        # --- Batch (same settings above, applied to every texture in a folder) ---
+        self.batch_bar = BatchBar(self._root, "Run batch")
+        self.batch_bar.runRequested.connect(self._on_run_batch)
+        self._controls_layout.addWidget(self.batch_bar)
+
         self.status = QLabel("Ready — check a mask active for live preview, or Process & Save.")
         self.status.setWordWrap(True)
         self._controls_layout.addWidget(self.status)
@@ -842,6 +1073,151 @@ class MatteBlendPanel(QWidget):
 
         self._seed_default_paths()
         self._discover_channels()
+        self._refresh_preset_list()
+
+    # -- presets --------------------------------------------------------------
+    def _preset_path(self, name: str) -> str:
+        safe = "".join(c for c in name if c.isalnum() or c in (" ", "_", "-")).strip()
+        return os.path.join(self._presets_dir, f"{safe}.json")
+
+    def _refresh_preset_list(self) -> None:
+        current = self.preset_combo.currentText()
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        if os.path.isdir(self._presets_dir):
+            names = sorted(
+                os.path.splitext(os.path.basename(p))[0]
+                for p in glob.glob(os.path.join(self._presets_dir, "*.json"))
+            )
+            self.preset_combo.addItems(names)
+        idx = self.preset_combo.findText(current)
+        if idx >= 0:
+            self.preset_combo.setCurrentIndex(idx)
+        self.preset_combo.blockSignals(False)
+
+    def _channels_to_preset(self) -> List[dict]:
+        return [panel.to_preset_dict() for panel in self._channel_panels]
+
+    def to_preset_dict(self) -> dict:
+        """Full UI state (everything except the input texture path) — for presets."""
+        override_color = self.diffuse_color_row.stored_color()
+        return {
+            "version": 1,
+            "diffuse_path": self.diffuse_edit.text().strip(),
+            "diffuse_mode": self.diffuse_mode.currentText(),
+            "feature_preserve_path": self.feature_edit.text().strip(),
+            "self_locality_radius": self.self_locality_radius.value(),
+            "diffuse_color_override_enabled": self.diffuse_color_row.is_override_enabled(),
+            "diffuse_color_override": list(override_color),
+            "luminance_only": self.chk_luma_only.isChecked(),
+            "live_preview": self.chk_live.isChecked(),
+            "exposure": self.exposure.value(),
+            "gamma": self.gamma.value(),
+            "shadow_bias": self.shadow_bias.value(),
+            "out_texture_path": self.out_texture.text().strip(),
+            "out_masks_dir": self.out_masks_dir.text().strip(),
+            "channels": self._channels_to_preset(),
+        }
+
+    def apply_preset_dict(self, data: dict) -> None:
+        self.diffuse_edit.setText(data.get("diffuse_path", ""))
+        mode = data.get("diffuse_mode")
+        if mode:
+            self.diffuse_mode.setCurrentText(mode)
+        self.feature_edit.setText(data.get("feature_preserve_path", ""))
+        if "self_locality_radius" in data:
+            self.self_locality_radius.setValue(data["self_locality_radius"])
+
+        color = data.get("diffuse_color_override")
+        enabled = bool(data.get("diffuse_color_override_enabled", False))
+        self.diffuse_color_row.set_preset_state(enabled, tuple(color) if color else None)
+
+        if "luminance_only" in data:
+            self.chk_luma_only.setChecked(bool(data["luminance_only"]))
+        if "live_preview" in data:
+            self.chk_live.setChecked(bool(data["live_preview"]))
+        if "exposure" in data:
+            self.exposure.setValue(data["exposure"])
+        if "gamma" in data:
+            self.gamma.setValue(data["gamma"])
+        if "shadow_bias" in data:
+            self.shadow_bias.setValue(data["shadow_bias"])
+        if "out_texture_path" in data:
+            self.out_texture.setText(data["out_texture_path"])
+        if "out_masks_dir" in data:
+            self.out_masks_dir.setText(data["out_masks_dir"])
+
+        # Rebuild mask channels from scratch to match the preset exactly.
+        for panel in list(self._channel_panels):
+            self._remove_channel_panel(panel)
+        for ch_data in data.get("channels", []):
+            self._add_channel_panel(ch_data.get("name", "channel"), ch_data.get("mask_path", ""))
+            self._channel_panels[-1].apply_preset_dict(ch_data)
+
+        self._sample_cache = None
+        self._schedule_live_preview()
+
+    def _on_save_preset(self) -> None:
+        name, ok = QInputDialog.getText(
+            self, "Save preset", "Preset name:", text=self.preset_combo.currentText()
+        )
+        name = name.strip()
+        if not ok or not name:
+            return
+        os.makedirs(self._presets_dir, exist_ok=True)
+        path = self._preset_path(name)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.to_preset_dict(), f, indent=2)
+        except OSError as exc:
+            QMessageBox.critical(self, "Save preset", f"Failed to save preset:\n{exc}")
+            return
+        self._refresh_preset_list()
+        idx = self.preset_combo.findText(name)
+        if idx >= 0:
+            self.preset_combo.setCurrentIndex(idx)
+        self.status.setText(f"Preset saved: {path}")
+
+    def _on_load_preset(self) -> None:
+        name = self.preset_combo.currentText().strip()
+        if not name:
+            QMessageBox.warning(self, "Load preset", "Select a preset to load.")
+            return
+        path = self._preset_path(name)
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "Load preset", f"Preset not found: {path}")
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            QMessageBox.critical(self, "Load preset", f"Failed to load preset:\n{exc}")
+            return
+        self.apply_preset_dict(data)
+        self.status.setText(f"Preset loaded: {path}")
+
+    def _on_delete_preset(self) -> None:
+        name = self.preset_combo.currentText().strip()
+        if not name:
+            return
+        path = self._preset_path(name)
+        if not os.path.isfile(path):
+            return
+        reply = QMessageBox.question(
+            self,
+            "Delete preset",
+            f"Delete preset '{name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            os.remove(path)
+        except OSError as exc:
+            QMessageBox.critical(self, "Delete preset", f"Failed to delete preset:\n{exc}")
+            return
+        self._refresh_preset_list()
+        self.status.setText(f"Preset deleted: {name}")
 
     # -- channel discovery / management --------------------------------------
     def _discover_channels(self) -> None:
@@ -977,6 +1353,92 @@ class MatteBlendPanel(QWidget):
             out_masks_dir=self.out_masks_dir.text().strip() or None,
         )
 
+    def _gather_batch_template_params(self) -> dict:
+        """Like ``_gather_params`` but for a whole folder: validates the settings that are
+        shared across every file (masks, diffuse, feature-preserve, post-process) without
+        requiring a single texture to already be selected, and without loading a sample.
+        """
+        diffuse = self.diffuse_edit.text().strip()
+        diffuse_mode = self.diffuse_mode.currentText()
+        diffuse_color_override = self.diffuse_color_row.override_color()
+        if diffuse_mode != "self" and diffuse_color_override is None and (not diffuse or not os.path.isfile(diffuse)):
+            raise FileNotFoundError(
+                "Select a valid diffuse image, switch diffuse mode to 'self', or enable a diffuse color override."
+            )
+
+        feature = self.feature_edit.text().strip() or None
+        if feature and not os.path.isfile(feature):
+            raise FileNotFoundError(f"Feature preserve mask not found: {feature}")
+
+        channels: List[MaskChannel] = []
+        for panel in self._channel_panels:
+            ch = panel.to_channel()
+            if ch.enabled:
+                if not ch.mask_path or not os.path.isfile(ch.mask_path):
+                    raise FileNotFoundError(f"Mask file not found for channel '{ch.name}': {ch.mask_path}")
+            channels.append(ch)
+
+        return dict(
+            channels=channels,
+            diffuse_path=diffuse,
+            diffuse_mode=diffuse_mode,
+            diffuse_color_override=diffuse_color_override,
+            self_locality_radius=self.self_locality_radius.value(),
+            feature_preserve_path=feature,
+            luminance_only=self.chk_luma_only.isChecked(),
+            exposure=self.exposure.value(),
+            gamma=self.gamma.value(),
+            shadow_bias=self.shadow_bias.value(),
+            out_masks_dir=self.out_masks_dir.text().strip() or None,
+        )
+
+    def _on_run_batch(self) -> None:
+        input_dir = self.batch_bar.input_dir()
+        output_dir = self.batch_bar.output_dir()
+        if not input_dir or not os.path.isdir(input_dir):
+            QMessageBox.warning(self, "Batch", "Select a valid input folder.")
+            return
+        if not output_dir:
+            QMessageBox.warning(self, "Batch", "Select an output folder.")
+            return
+
+        input_paths = list_images(input_dir)
+        if not input_paths:
+            QMessageBox.warning(self, "Batch", f"No images found in: {input_dir}")
+            return
+
+        try:
+            base_params = self._gather_batch_template_params()
+        except Exception as exc:
+            QMessageBox.warning(self, "Batch", str(exc))
+            return
+
+        os.makedirs(output_dir, exist_ok=True)
+        self.batch_bar.set_running(True)
+        self.run_btn.setEnabled(False)
+        self.batch_bar.set_status(f"Processing 0/{len(input_paths)}…")
+
+        self._batch_worker = BatchWorker(input_paths, output_dir, base_params, self)
+        self._batch_worker.fileDone.connect(self._on_batch_file_done)
+        self._batch_worker.fileFailed.connect(self._on_batch_file_failed)
+        self._batch_worker.batchFinished.connect(self._on_batch_finished)
+        self._batch_worker.start()
+
+    def _on_batch_file_done(self, index: int, total: int, name: str) -> None:
+        self.batch_bar.set_status(f"Processing {index}/{total}: {name}")
+
+    def _on_batch_file_failed(self, index: int, total: int, name: str, _error: str) -> None:
+        self.batch_bar.set_status(f"Processing {index}/{total}: {name} — failed, see console")
+
+    def _on_batch_finished(self, ok_count: int, total: int, failures: List[Tuple[str, str]]) -> None:
+        self.batch_bar.set_running(False)
+        self.run_btn.setEnabled(True)
+        if failures:
+            names = ", ".join(name for name, _ in failures)
+            self.batch_bar.set_status(f"Batch done: {ok_count}/{total} saved. Failed: {names} (see console).")
+        else:
+            self.batch_bar.set_status(f"Batch done: {ok_count}/{total} saved.")
+
     def _start_job(self, params: dict, write_outputs: bool) -> None:
         if self._worker and self._worker.isRunning():
             self._pending_run = (params, write_outputs)
@@ -1068,11 +1530,11 @@ class AppWindow(QMainWindow):
         self.setWindowTitle("Mask Luminance Tool")
         self.resize(1450, 950)
 
-        from multiview_feature_tab import MultiviewFeatureTab
+        from multiview_feature_tab import TextureSegmentationTab
 
         tabs = QTabWidget()
         tabs.addTab(MatteBlendPanel(), "Matte Blend")
-        tabs.addTab(MultiviewFeatureTab(), "Multiview Feature Bake")
+        tabs.addTab(TextureSegmentationTab(), "Texture Segmentation")
         self.setCentralWidget(tabs)
 
 

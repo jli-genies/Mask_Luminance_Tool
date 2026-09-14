@@ -9,3 +9,4 @@
 numpy==1.26.4
 opencv-python==4.11.0.86
 PyQt6==6.11.0
+mediapipe==0.10.21

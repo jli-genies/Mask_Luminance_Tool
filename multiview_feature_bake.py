@@ -129,20 +129,25 @@ def build_view_data(view_files: Dict[str, Tuple[str, str]]) -> Tuple[Dict[str, A
 # ---------------------------------------------------------------------------
 # Eyebrows + lips rasterization
 # ---------------------------------------------------------------------------
+FEATURE_GROUPS = ("right_brow", "left_brow", "lip")
+
+
 def rasterize_feature_mask(
     names: List[str],
     pos_px: np.ndarray,
     width: int,
     height: int,
     feather_px: int = 6,
+    groups: Tuple[str, ...] = FEATURE_GROUPS,
 ) -> np.ndarray:
-    """Fills convex hulls over the brow/lip landmark groups onto a blank RGBA canvas.
+    """Fills convex hulls over the requested landmark groups onto a blank RGBA canvas.
 
-    Two hulls for the eyebrows (one per side) and one for the outer lip contour, matching the
-    "eyebrows and lips" feature the multiview render is meant to isolate. RGB is the actual
-    signal (255 = feature, 0 = skin); alpha marks which pixels were actually observed by this
-    camera view at all (a dilated hull over the *full* landmark set, i.e. an approximate face
-    silhouette), 0 outside it.
+    ``groups`` selects which of FEATURE_GROUPS to rasterize — the default renders eyebrows
+    and lips together (the original "eyebrows and lips" feature the multiview render was meant
+    to isolate); pass e.g. ``("lip",)`` to isolate just the lips. RGB is the actual signal (255
+    = feature, 0 = skin); alpha marks which pixels were actually observed by this camera view at
+    all (a dilated hull over the *full* landmark set, i.e. an approximate face silhouette), 0
+    outside it.
 
     The alpha channel matters, not just the RGB: TmBakeTextureFromImages only runs its own
     photograph-oriented background-removal floodfill when the source image has no meaningful
@@ -157,12 +162,13 @@ def rasterize_feature_mask(
     rgb = np.zeros((height, width), dtype=np.uint8)
     by_name = dict(zip(names, pos_px))
 
-    groups = {
+    group_members = {
         "right_brow": [n for n in names if "right_brow" in n],
         "left_brow": [n for n in names if "left_brow" in n],
         "lip": [n for n in names if "_lip_" in n],
     }
-    for group_names in groups.values():
+    for key in groups:
+        group_names = group_members[key]
         if len(group_names) < 3:
             continue
         pts = np.array([by_name[n] for n in group_names], dtype=np.float32)
@@ -184,8 +190,14 @@ def rasterize_feature_mask(
     return np.dstack([rgb, rgb, rgb, alpha])
 
 
-def _write_feature_masks(view_data: Dict[str, Any], view_tokens: List[str], out_dir: str, feather_px: int) -> None:
-    """Rasterizes each view's brow/lip mask and repoints view_data's image_path at it in place.
+def _write_feature_masks(
+    view_data: Dict[str, Any],
+    view_tokens: List[str],
+    out_dir: str,
+    feather_px: int,
+    groups: Tuple[str, ...] = FEATURE_GROUPS,
+) -> None:
+    """Rasterizes each view's feature mask and repoints view_data's image_path at it in place.
 
     image_path is stored as an absolute path: tm_texture_from_images is called below with
     input_images_dir="" (see bake_feature_layer) specifically so genies doesn't re-join it with
@@ -196,7 +208,9 @@ def _write_feature_masks(view_data: Dict[str, Any], view_tokens: List[str], out_
     os.makedirs(out_dir, exist_ok=True)
     for token in view_tokens:
         data = view_data[token]
-        mask = rasterize_feature_mask(data["names"], data["pos_px"], data["width"], data["height"], feather_px)
+        mask = rasterize_feature_mask(
+            data["names"], data["pos_px"], data["width"], data["height"], feather_px, groups
+        )
         mask_path = os.path.abspath(os.path.join(out_dir, f"feature_mask_{token}.png")).replace("\\", "/")
         cv2.imwrite(mask_path, mask)
         data["image_path"] = mask_path
@@ -264,8 +278,9 @@ def bake_feature_layer(
     output_image_name: str,
     output_size: int = 1024,
     feather_px: int = 6,
+    feature_groups: Tuple[str, ...] = FEATURE_GROUPS,
 ) -> str:
-    """Bakes an eyebrows+lips UV mask from a diffuse multiview render set.
+    """Bakes a feature UV mask from a diffuse multiview render set.
 
     Args:
         view_files: {view_token: (diffuse_image_path, landmark_json_path)}, tokens already in
@@ -275,14 +290,16 @@ def bake_feature_layer(
         glb_path: the character's head mesh.
         output_dir: where the baked mask (and intermediate per-view masks) are written.
         output_image_name: filename for the baked UV mask.
+        feature_groups: which of FEATURE_GROUPS to include, e.g. ("lip",) for a lips-only mask
+            instead of the default combined eyebrows+lips mask.
 
     Returns:
-        Absolute path to the baked eyebrows+lips UV mask PNG.
+        Absolute path to the baked UV mask PNG.
     """
     view_data, view_tokens = build_view_data(view_files)
 
     masks_dir = os.path.join(output_dir, "feature_masks")
-    _write_feature_masks(view_data, view_tokens, masks_dir, feather_px)
+    _write_feature_masks(view_data, view_tokens, masks_dir, feather_px, feature_groups)
 
     lm_names, lm_points = load_usd_landmarks(template_landmarks_usd, landmarks_variant)
     head_mesh = load_head_mesh(glb_path)
