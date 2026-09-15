@@ -39,6 +39,12 @@ _FEATURE_CONNECTION_ATTRS = {
     "left_eyebrow": "FACEMESH_LEFT_EYEBROW",
     "right_eyebrow": "FACEMESH_RIGHT_EYEBROW",
 }
+# Debug-visualization colors only (RGB) — unrelated to the mask math above.
+_FEATURE_COLORS = {
+    "lips": (255, 80, 80),
+    "left_eyebrow": (80, 200, 255),
+    "right_eyebrow": (255, 200, 80),
+}
 
 
 def find_islands(texture: np.ndarray, min_area: int = _MIN_ISLAND_AREA) -> List[Tuple[int, int, int, int]]:
@@ -108,4 +114,39 @@ def bake_feature_mask(
             k = feather_px * 2 + 1
             mask = cv2.GaussianBlur(mask, (k, k), 0)
         return mask
+    raise ValueError("No face detected in any UV island of this texture.")
+
+
+def debug_landmarks_image(
+    texture: np.ndarray,
+    features: Sequence[str] = FEATURE_GROUPS,
+    point_radius: int = 2,
+) -> np.ndarray:
+    """Draws each feature's raw FaceMesh points and convex-hull outline over the texture.
+
+    Diagnostic view of what bake_feature_mask actually hulls — useful for judging, before a
+    binary mask is baked, whether the eyebrow points a straight convex hull would connect
+    actually trace that eyebrow's real (non-convex) shape, since eyebrow silhouettes vary a
+    lot per character and a hull is only ever an approximation of them. Same points are also
+    what a later segmentation-model pass (e.g. point prompts) would seed from.
+
+    Returns an RGB image at the same resolution as ``texture``. Raises ValueError if no face
+    is found in any island.
+    """
+    h, w = texture.shape[:2]
+    vis = texture[..., :3].copy()
+    for (x, y, iw, ih) in find_islands(texture)[:_MAX_ISLANDS_TRIED]:
+        all_pts = detect_landmarks(texture[y:y + ih, x:x + iw])
+        if all_pts is None:
+            continue
+        offset = np.array([x, y], dtype=np.float32)
+        for feature in features:
+            color = _FEATURE_COLORS.get(feature, (0, 255, 0))
+            idx = _feature_point_indices(feature)
+            pts = (all_pts[idx] + offset).astype(np.int32)
+            hull = cv2.convexHull(pts)
+            cv2.polylines(vis, [hull], isClosed=True, color=color, thickness=1, lineType=cv2.LINE_AA)
+            for px, py in pts:
+                cv2.circle(vis, (int(px), int(py)), point_radius, color, -1, lineType=cv2.LINE_AA)
+        return vis
     raise ValueError("No face detected in any UV island of this texture.")
