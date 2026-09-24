@@ -35,6 +35,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--categories", nargs="+", required=True, help="GenieSAM text-prompt category names.")
     p.add_argument("--device", default="cuda", choices=("cuda", "cpu"))
     p.add_argument("--image-size", type=int, default=1008)
+    p.add_argument(
+        "--beard-score-threshold",
+        type=float,
+        default=None,
+        help="Override GenieSAM config.yaml's beard_score threshold (0-1). Lower catches more "
+             "beard on textures where hair/skin color contrast is low (e.g. darker skin tones), "
+             "at the cost of more false positives. Defaults to the GenieSAM config's own value.",
+    )
     args = p.parse_args()
     if args.image and not args.output_dir:
         p.error("--image requires --output-dir")
@@ -67,6 +75,9 @@ def main() -> int:
 
     model, image_transform = load_sam3_model(args.device, args.image_size, sam3_ckpt=args.checkpoint)
     cfg = get_config()
+    beard_score_threshold = (
+        args.beard_score_threshold if args.beard_score_threshold is not None else cfg.beard_score_threshold
+    )
 
     def segment_one(image_path: str, out_dir: str) -> list:
         image_np = load_image(image_path)
@@ -83,7 +94,7 @@ def main() -> int:
             min_area=cfg.min_area,
             score_threshold=cfg.score_threshold,
             area_threshold=cfg.area_threshold,
-            beard_score_threshold=cfg.beard_score_threshold,
+            beard_score_threshold=beard_score_threshold,
             post_process=cfg.post_process_enabled,
         )
         if args.device == "cuda":

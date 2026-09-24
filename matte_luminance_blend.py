@@ -52,7 +52,7 @@ DEFAULT_REGION_PALETTE: Dict[str, Tuple[int, int, int]] = {
     "back_head": (56, 200, 248),  # cyan
 }
 
-GATE_MODES = ("weight", "blue_paint", "color_id")
+GATE_MODES = ("weight", "blue_paint", "color_id", "beard_color")
 
 # Default blur radius (px) for reconstructing the "self" diffuse target's
 # local shading gradient — see build_local_diffuse_target().
@@ -77,6 +77,14 @@ class MaskChannel:
             "color_id": ``mask_path`` is a multi-region ID color map;
                 ``regions``/``region_tolerance`` select which named regions
                 (from the palette) participate.
+            "beard_color": ``mask_path`` is a spatial mask (e.g. a beard
+                segmentation or a hand-painted chin/cheek region) used the
+                same way as "weight"; on top of that, only pixels of the
+                *sample* texture within ``region_tolerance`` of
+                ``beard_color`` count — so the gate only covers where the
+                spatial mask AND the picked beard color agree, precise even
+                where the spatial mask alone is coarse (e.g. missed a
+                lower-contrast beard on darker skin).
         threshold: Minimum |luminance(sample) - luminance(diffuse_target)|
             (0-255) before a gated pixel enters the mask.
         radius: Gaussian sigma (px) used both to feather the mask and (when
@@ -95,8 +103,13 @@ class MaskChannel:
             painted ring.
         regions: gate_mode="color_id" only — subset of palette region names
             to include. None means all.
-        region_tolerance: gate_mode="color_id" only — RGB tolerance when
-            matching ID mask colors.
+        region_tolerance: RGB tolerance when color-matching — against ID
+            mask colors for gate_mode="color_id", or against ``beard_color``
+            for gate_mode="beard_color".
+        beard_color: gate_mode="beard_color" only — reference RGB the sample
+            texture is matched against (see gate_mode above). Typically
+            sampled from the mean color of the segmented beard mask on the
+            texture being processed, then hand-adjustable from there.
         blend_group: Optional group name. Channels sharing the same non-empty
             group are not applied sequentially (one on top of the other's
             output); instead each computes its own correction independently
@@ -164,10 +177,13 @@ class MaskChannel:
     flat_fill: bool = False
     mask_authoritative: bool = False
     fill_from_own_mask: bool = False
+    beard_color: Optional[Tuple[int, int, int]] = None
 
     def __post_init__(self) -> None:
         if self.gate_mode not in GATE_MODES:
             raise ValueError(f"Unknown gate_mode '{self.gate_mode}'. Known: {GATE_MODES}")
+        if self.gate_mode == "beard_color" and self.beard_color is None:
+            raise ValueError("beard_color must be set when gate_mode='beard_color'.")
 
 
 # =============================================================================
@@ -184,6 +200,10 @@ def load_rgb(path: str) -> np.ndarray:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     if img.shape[2] == 4:
         img = img[:, :, :3]
+    if img.dtype == np.uint16:
+        img = (img >> 8).astype(np.uint8)
+    elif img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
@@ -480,6 +500,22 @@ def composite_weights(mask_img: np.ndarray) -> np.ndarray:
     return (luminance(mask_img) / 255.0).astype(np.float32)
 
 
+def load_combined_weight_mask(path_spec: str, shape_hw: Tuple[int, int]) -> np.ndarray:
+    """Loads a feature-preserve mask spec: one path, or several joined with ';', unioned via
+    pixel-wise maximum (same combination rule used for overlapping channel gates elsewhere in
+    this module). Lets a mask that only sometimes applies -- e.g. a beard mask, present only
+    for concept renders that have one -- be added to or dropped from the mix per texture
+    without touching the mask files feeding the rest of the pipeline.
+    """
+    combined = np.zeros(shape_hw, dtype=np.float32)
+    for path in path_spec.split(";"):
+        path = path.strip()
+        if not path:
+            continue
+        combined = np.maximum(combined, composite_weights(resize_to(load_rgb(path), shape_hw, nearest=False)))
+    return combined
+
+
 def composite_skin_envelope(
     mask_img: np.ndarray,
     support_min: float = 1.0 / 255.0,
@@ -525,13 +561,25 @@ def compute_channel_gate(
     mask_img: np.ndarray,
     channel: MaskChannel,
     palette: Dict[str, Tuple[int, int, int]],
+    sample: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Resolves one channel's gate (0-1 weights) from its mask image."""
+    """Resolves one channel's gate (0-1 weights) from its mask image.
+
+    ``sample`` (the texture being corrected) is only needed for
+    gate_mode="beard_color", which color-matches against it rather than
+    against ``mask_img`` — ``mask_img`` there is a plain spatial mask (no
+    beard-colored pixels of its own to match against).
+    """
     if channel.gate_mode == "blue_paint":
         return extract_blue_paint_mask(mask_img)
     if channel.gate_mode == "color_id":
         return build_region_gate(mask_img, palette, channel.region_tolerance, channel.regions)
-    return composite_skin_envelope(mask_img) if channel.fill_holes else composite_weights(mask_img)
+    spatial = composite_skin_envelope(mask_img) if channel.fill_holes else composite_weights(mask_img)
+    if channel.gate_mode == "beard_color":
+        if sample is None:
+            raise ValueError("compute_channel_gate needs `sample` for gate_mode='beard_color'.")
+        spatial = spatial * color_id_mask(sample, channel.beard_color, channel.region_tolerance)
+    return spatial
 
 
 # =============================================================================
@@ -754,7 +802,7 @@ def compute_channel_soft_mask(
     feature_preserve: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Resolves one channel's soft weight mask: gate -> threshold -> feather."""
-    gate = compute_channel_gate(mask_img, channel, palette)
+    gate = compute_channel_gate(mask_img, channel, palette, sample=working)
     if feature_preserve is not None:
         gate = gate * (1.0 - np.clip(feature_preserve, 0.0, 1.0))
 
@@ -830,13 +878,14 @@ def apply_mask_channel(
     brows) would keep showing through its original color no matter how
     opaque the mask is or how high ``strength`` is set — defeating the point
     of a *flat* fill, which needs to replace hue too. ``own_mask_target``
-    (required if ``channel.fill_from_own_mask``) takes priority over
-    ``flat_target`` when both are set — see ``MaskChannel.fill_from_own_mask``.
+    (required if ``channel.fill_from_own_mask``, or always for gate_mode="beard_color")
+    takes priority over ``flat_target`` when both are set — see
+    ``MaskChannel.fill_from_own_mask``/``beard_color``.
 
     Returns the updated working texture and the channel's soft weight mask
     (post-feather, pre-strength — useful for debug output).
     """
-    if channel.flat_fill and channel.fill_from_own_mask and own_mask_target is not None:
+    if channel.flat_fill and (channel.fill_from_own_mask or channel.gate_mode == "beard_color") and own_mask_target is not None:
         target = own_mask_target
     elif channel.flat_fill and flat_target is not None:
         target = flat_target
@@ -915,7 +964,8 @@ def apply_blend_group(
     is preserved everywhere except the overlap, which blends smoothly instead
     of one channel hard-overwriting the other. ``own_mask_targets`` (keyed by
     channel name) overrides ``flat_target`` per-channel for any member with
-    ``fill_from_own_mask`` set — see ``MaskChannel.fill_from_own_mask``.
+    ``fill_from_own_mask`` set, or with gate_mode="beard_color" — see
+    ``MaskChannel.fill_from_own_mask``/``beard_color``.
     """
     targets: List[np.ndarray] = []
     weights: List[np.ndarray] = []
@@ -923,7 +973,7 @@ def apply_blend_group(
 
     for ch in group_channels:
         ch_own_target = (own_mask_targets or {}).get(ch.name)
-        if ch.flat_fill and ch.fill_from_own_mask and ch_own_target is not None:
+        if ch.flat_fill and (ch.fill_from_own_mask or ch.gate_mode == "beard_color") and ch_own_target is not None:
             ch_target = ch_own_target
         elif ch.flat_fill and flat_target is not None:
             ch_target = flat_target
@@ -1017,7 +1067,7 @@ def process(
     diffuse_mode: str = "self",
     region_palette: Optional[Dict[str, Tuple[int, int, int]]] = None,
     luminance_only: bool = True,
-    feature_preserve_path: Optional[str] = None,
+    feature_preserve_path: Optional[str] = None,  # one path, or several joined with ';' (see load_combined_weight_mask)
     out_masks_dir: Optional[str] = None,
     self_locality_radius: float = DEFAULT_SELF_LOCALITY_RADIUS,
     diffuse_color_override: Optional[Sequence[float]] = None,
@@ -1055,13 +1105,11 @@ def process(
 
     feature_preserve = None
     if feature_preserve_path:
-        feature_preserve = composite_weights(
-            resize_to(load_rgb(feature_preserve_path), sample.shape[:2], nearest=False)
-        )
+        feature_preserve = load_combined_weight_mask(feature_preserve_path, sample.shape[:2])
 
     exclude = np.zeros(sample.shape[:2], dtype=np.float32)
     for ch in active:
-        exclude = np.maximum(exclude, compute_channel_gate(mask_imgs[ch.name], ch, palette))
+        exclude = np.maximum(exclude, compute_channel_gate(mask_imgs[ch.name], ch, palette, sample=sample))
     if feature_preserve is not None:
         exclude = np.maximum(exclude, feature_preserve)
 
@@ -1087,8 +1135,18 @@ def process(
 
     own_mask_targets: Dict[str, np.ndarray] = {}
     for ch in active:
-        if ch.flat_fill and ch.fill_from_own_mask:
-            gate = compute_channel_gate(mask_imgs[ch.name], ch, palette)
+        if not ch.flat_fill:
+            continue
+        if ch.gate_mode == "beard_color":
+            # The whole point of this gate is the picked color, not whatever the shared
+            # clean-skin flat fill happens to be -- always fill with it exactly, regardless
+            # of fill_from_own_mask (an *average* of the gated pixels would only ever
+            # approximate the picked color, not match a manually adjusted one).
+            own_mask_targets[ch.name] = np.broadcast_to(
+                np.asarray(ch.beard_color, dtype=np.float32), sample.shape
+            ).copy()
+        elif ch.fill_from_own_mask:
+            gate = compute_channel_gate(mask_imgs[ch.name], ch, palette, sample=sample)
             color = estimate_own_mask_color(sample, gate)
             own_mask_targets[ch.name] = np.broadcast_to(color, sample.shape).astype(np.float32).copy()
 
@@ -1144,7 +1202,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         help="JSON file: a list of mask-channel objects, each matching the "
              "MaskChannel fields (name, mask_path, enabled, gate_mode, "
              "threshold, radius, strength, diffuse_mix, use_infill, "
-             "spill_outside, fill_holes, regions, region_tolerance).",
+             "spill_outside, fill_holes, regions, region_tolerance, "
+             "beard_color).",
     )
     parser.add_argument(
         "--diffuse",
@@ -1171,7 +1230,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         "--feature-preserve-mask",
         default=None,
         help="Grayscale mask: bright areas (eyes/mouth/etc.) are protected from every "
-             "channel's correction and excluded from self-mode skin sampling.",
+             "channel's correction and excluded from self-mode skin sampling. Join several "
+             "paths with ';' to union them (e.g. a lips mask plus a beard mask that's only "
+             "present for concept renders that have one).",
     )
     parser.add_argument(
         "--full-rgb",

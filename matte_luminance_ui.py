@@ -12,7 +12,7 @@ import json
 import os
 import sys
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
@@ -49,9 +49,11 @@ from matte_luminance_blend import (
     GATE_MODES,
     MaskChannel,
     build_local_diffuse_target,
-    compute_channel_gate,
+    composite_skin_envelope,
     composite_weights,
+    compute_channel_gate,
     estimate_own_mask_color,
+    load_combined_weight_mask,
     load_rgb,
     make_diffuse_target,
     resize_to,
@@ -67,6 +69,16 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _validate_feature_preserve_paths(spec: Optional[str]) -> None:
+    """Raises if any ';'-separated path in a feature-preserve mask spec doesn't exist."""
+    if not spec:
+        return
+    for path in spec.split(";"):
+        path = path.strip()
+        if path and not os.path.isfile(path):
+            raise FileNotFoundError(f"Feature preserve mask not found: {path}")
+
+
 def _rgb_to_qpixmap(rgb: np.ndarray) -> QPixmap:
     """Convert uint8 RGB/RGBA (or gray) numpy array to a full-resolution QPixmap."""
     arr = np.ascontiguousarray(np.clip(rgb, 0, 255).astype(np.uint8))
@@ -378,18 +390,26 @@ class ChannelPanel(QGroupBox):
     moveUpRequested = pyqtSignal(object)
     moveDownRequested = pyqtSignal(object)
 
-    def __init__(self, name: str, mask_path: str, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        mask_path: str,
+        parent: Optional[QWidget] = None,
+        sample_provider: Optional[Callable[[], Optional[np.ndarray]]] = None,
+    ) -> None:
         super().__init__(name, parent)
         self.setCheckable(True)
         self.setChecked(False)
+        self._sample_provider = sample_provider
+        self._beard_color: Tuple[int, int, int] = (101, 67, 44)
 
         form = QFormLayout(self)
 
         self.mask_type = QComboBox()
-        self.mask_type.addItems(["Custom", "Shadow", "Highlight"])
+        self.mask_type.addItems(["Custom", "Shadow", "Highlight", "Beard"])
         self.mask_type.setToolTip(
-            "One-shot preset: applies canned Shadow/Highlight values to this panel's own "
-            "fields below. Unlike the Blender addon, these fields are NOT kept in sync "
+            "One-shot preset: applies canned Shadow/Highlight/Beard values to this panel's "
+            "own fields below. Unlike the Blender addon, these fields are NOT kept in sync "
             "across channels afterward — re-pick the type to re-apply if you change your mind."
         )
         form.addRow("Mask type (preset)", self.mask_type)
@@ -428,6 +448,31 @@ class ChannelPanel(QGroupBox):
         form.addRow("Regions", self.region_row)
         self.region_tolerance = _SliderSpin(0.0, 120.0, 40.0, step=1.0, decimals=0, slider_scale=1)
         form.addRow("Region tolerance", self.region_tolerance)
+
+        self.beard_color_row = QWidget()
+        bcl = QHBoxLayout(self.beard_color_row)
+        bcl.setContentsMargins(0, 0, 0, 0)
+        self.beard_swatch = QLabel()
+        self.beard_swatch.setFixedSize(28, 20)
+        self.beard_swatch.setFrameShape(QFrame.Shape.Box)
+        self.beard_color_text = QLabel("—")
+        self.beard_color_text.setMinimumWidth(90)
+        beard_pick_btn = QPushButton("Pick…")
+        beard_pick_btn.setFixedWidth(60)
+        beard_sample_btn = QPushButton("Sample from mask")
+        beard_sample_btn.setToolTip(
+            "Averages the sample texture's own pixels under this channel's Mask file (the "
+            "segmented beard mask, or any spatial region) to set the reference beard color."
+        )
+        beard_pick_btn.clicked.connect(self._on_pick_beard_color)
+        beard_sample_btn.clicked.connect(self._on_sample_beard_color)
+        bcl.addWidget(self.beard_swatch)
+        bcl.addWidget(self.beard_color_text)
+        bcl.addWidget(beard_pick_btn)
+        bcl.addWidget(beard_sample_btn)
+        bcl.addStretch(1)
+        form.addRow("Beard color", self.beard_color_row)
+        self._update_beard_swatch()
 
         self.threshold = _SliderSpin(0.0, 80.0, 12.0, step=0.5, decimals=1, slider_scale=10)
         self.radius = _SliderSpin(0.0, 200.0, 8.0, step=0.5, decimals=1, slider_scale=10)
@@ -511,7 +556,11 @@ class ChannelPanel(QGroupBox):
     def _on_gate_mode_changed(self, mode: str) -> None:
         self.fill_holes.setVisible(mode == "weight")
         self.region_row.setVisible(mode == "color_id")
-        self.region_tolerance.setVisible(mode == "color_id")
+        self.region_tolerance.setVisible(mode in ("color_id", "beard_color"))
+        self.beard_color_row.setVisible(mode == "beard_color")
+        tol_label = self.layout().labelForField(self.region_tolerance)
+        if tol_label is not None:
+            tol_label.setText("Color tolerance" if mode == "beard_color" else "Region tolerance")
         self.changed.emit()
 
     def _on_flat_fill_toggled(self, on: bool) -> None:
@@ -542,6 +591,65 @@ class ChannelPanel(QGroupBox):
             self.flat_fill.setChecked(False)
             self.mask_authoritative.setChecked(True)
             self.diffuse_mix.setValue(0.5)
+        elif label == "Beard":
+            # Same shadow-style correction as "Shadow", but gated by the picked beard color
+            # on top of Mask file's own spatial region — see gate_mode="beard_color".
+            self.flat_fill.setChecked(True)
+            self.mask_authoritative.setChecked(True)
+            self.gate_mode.setCurrentText("beard_color")
+            sampled = self._sample_beard_color_from_mask()
+            if sampled is not None:
+                self._beard_color = sampled
+                self._update_beard_swatch()
+        self.changed.emit()
+
+    def _update_beard_swatch(self) -> None:
+        r, g, b = self._beard_color
+        self.beard_swatch.setStyleSheet(f"background-color: rgb({r},{g},{b}); border: 1px solid #888;")
+        self.beard_color_text.setText(f"{r}, {g}, {b}")
+
+    def _on_pick_beard_color(self) -> None:
+        r, g, b = self._beard_color
+        chosen = QColorDialog.getColor(QColor(r, g, b), self, "Pick beard color")
+        if chosen.isValid():
+            self._beard_color = (chosen.red(), chosen.green(), chosen.blue())
+            self._update_beard_swatch()
+            self.changed.emit()
+
+    def _sample_beard_color_from_mask(self) -> Optional[Tuple[int, int, int]]:
+        """Mean color of the sample texture's pixels under this channel's own Mask file.
+
+        Returns None (rather than raising) on any failure — no texture loaded yet, no/invalid
+        mask file, or no coverage — so callers (an explicit button, or the "Beard" one-shot
+        preset) can fall back to the current/default color instead of crashing.
+        """
+        if self._sample_provider is None:
+            return None
+        mask_path = self.mask_path()
+        if not mask_path or not os.path.isfile(mask_path):
+            return None
+        sample = self._sample_provider()
+        if sample is None:
+            return None
+        try:
+            mask_img = resize_to(load_rgb(mask_path), sample.shape[:2], nearest=False)
+            gate = composite_skin_envelope(mask_img) if self.fill_holes.isChecked() else composite_weights(mask_img)
+            rgb = estimate_own_mask_color(sample, gate)
+        except Exception:
+            return None
+        return tuple(int(round(c)) for c in rgb)
+
+    def _on_sample_beard_color(self) -> None:
+        sampled = self._sample_beard_color_from_mask()
+        if sampled is None:
+            QMessageBox.warning(
+                self, "Sample beard color",
+                "Could not sample a color — make sure Mask file points at a valid image and "
+                "a texture is loaded (Texture (albedo), above)."
+            )
+            return
+        self._beard_color = sampled
+        self._update_beard_swatch()
         self.changed.emit()
 
     def _browse(self) -> None:
@@ -580,6 +688,7 @@ class ChannelPanel(QGroupBox):
             flat_fill=self.flat_fill.isChecked(),
             mask_authoritative=self.mask_authoritative.isChecked(),
             fill_from_own_mask=self.fill_from_own_mask.isChecked(),
+            beard_color=self._beard_color if mode == "beard_color" else None,
         )
 
     def to_preset_dict(self) -> dict:
@@ -604,6 +713,7 @@ class ChannelPanel(QGroupBox):
             "fill_from_own_mask": self.fill_from_own_mask.isChecked(),
             "blend_group": self.blend_group.text().strip(),
             "blend_weight": self.blend_weight.value(),
+            "beard_color": list(self._beard_color),
         }
 
     def apply_preset_dict(self, data: dict) -> None:
@@ -658,6 +768,11 @@ class ChannelPanel(QGroupBox):
                 bool(data.get("fill_from_own_mask", self.fill_from_own_mask.isChecked()))
             )
             self.blend_group.setText(data.get("blend_group") or "")
+
+            beard_color = data.get("beard_color")
+            if beard_color:
+                self._beard_color = tuple(int(c) for c in beard_color)
+                self._update_beard_swatch()
         finally:
             self.blockSignals(False)
 
@@ -685,14 +800,12 @@ def _process_texture(params: dict, write_outputs: bool) -> Dict[str, Any]:
 
     feature_preserve = None
     if p["feature_preserve_path"]:
-        feature_preserve = composite_weights(
-            resize_to(load_rgb(p["feature_preserve_path"]), sample.shape[:2], nearest=False)
-        )
+        feature_preserve = load_combined_weight_mask(p["feature_preserve_path"], sample.shape[:2])
 
     palette = DEFAULT_REGION_PALETTE
     exclude = np.zeros(sample.shape[:2], dtype=np.float32)
     for ch in active:
-        exclude = np.maximum(exclude, compute_channel_gate(mask_imgs[ch.name], ch, palette))
+        exclude = np.maximum(exclude, compute_channel_gate(mask_imgs[ch.name], ch, palette, sample=sample))
     if feature_preserve is not None:
         exclude = np.maximum(exclude, feature_preserve)
 
@@ -717,8 +830,14 @@ def _process_texture(params: dict, write_outputs: bool) -> Dict[str, Any]:
 
     own_mask_targets: Dict[str, np.ndarray] = {}
     for ch in active:
-        if ch.flat_fill and ch.fill_from_own_mask:
-            gate = compute_channel_gate(mask_imgs[ch.name], ch, palette)
+        if not ch.flat_fill:
+            continue
+        if ch.gate_mode == "beard_color":
+            own_mask_targets[ch.name] = np.broadcast_to(
+                np.asarray(ch.beard_color, dtype=np.float32), sample.shape
+            ).copy()
+        elif ch.fill_from_own_mask:
+            gate = compute_channel_gate(mask_imgs[ch.name], ch, palette, sample=sample)
             color = estimate_own_mask_color(sample, gate)
             own_mask_targets[ch.name] = np.broadcast_to(color, sample.shape).astype(np.float32).copy()
 
@@ -1019,6 +1138,10 @@ class MatteBlendPanel(QWidget):
         self.texture_edit = self._path_row(io, "Texture (albedo)", "", invalidate=True)
         self.diffuse_edit = self._path_row(io, "Diffuse", "", invalidate=True)
         self.feature_edit = self._path_row(io, "Feature preserve mask", "", invalidate=True)
+        self.feature_edit.setToolTip(
+            "Join several mask paths with ';' to union them, e.g. a lips mask plus a beard "
+            "mask that only applies to concept renders that have one."
+        )
 
         self.diffuse_mode = QComboBox()
         self.diffuse_mode.addItems(["self", "uv", "palette"])
@@ -1286,7 +1409,7 @@ class MatteBlendPanel(QWidget):
             self._add_channel_panel(name, path)
 
     def _add_channel_panel(self, name: str, mask_path: str) -> None:
-        panel = ChannelPanel(name, mask_path)
+        panel = ChannelPanel(name, mask_path, sample_provider=self._sample_for_color_pick)
         panel.changed.connect(self._schedule_live_preview)
         panel.removeRequested.connect(self._remove_channel_panel)
         panel.moveUpRequested.connect(lambda p: self._move_channel_panel(p, -1))
@@ -1375,6 +1498,18 @@ class MatteBlendPanel(QWidget):
         self._sample_cache = (texture_path, sample)
         return sample
 
+    def _sample_for_color_pick(self) -> Optional[np.ndarray]:
+        """Passed to each ChannelPanel so its beard-color sampling can read the currently
+        loaded texture (above) without the panel needing direct access to this whole tab.
+        """
+        texture = self.texture_edit.text().strip()
+        if not texture or not os.path.isfile(texture):
+            return None
+        try:
+            return self._ensure_sample(texture)
+        except Exception:
+            return None
+
     # -- process -------------------------------------------------------------
     def _gather_params(self) -> dict:
         texture = self.texture_edit.text().strip()
@@ -1389,8 +1524,7 @@ class MatteBlendPanel(QWidget):
             )
 
         feature = self.feature_edit.text().strip() or None
-        if feature and not os.path.isfile(feature):
-            raise FileNotFoundError(f"Feature preserve mask not found: {feature}")
+        _validate_feature_preserve_paths(feature)
 
         channels: List[MaskChannel] = []
         for panel in self._channel_panels:
@@ -1432,8 +1566,7 @@ class MatteBlendPanel(QWidget):
             )
 
         feature = self.feature_edit.text().strip() or None
-        if feature and not os.path.isfile(feature):
-            raise FileNotFoundError(f"Feature preserve mask not found: {feature}")
+        _validate_feature_preserve_paths(feature)
 
         channels: List[MaskChannel] = []
         for panel in self._channel_panels:

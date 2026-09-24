@@ -20,16 +20,19 @@ import traceback
 from typing import List, Optional, Tuple
 
 import cv2
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -39,7 +42,7 @@ from PyQt6.QtWidgets import (
 from matte_luminance_blend import load_rgb, save_rgb
 from matte_luminance_ui import BatchBar, ImageViewer, list_images, _path_row
 from texture_eyebrow_sam3 import bake_feature_mask_sam3, bake_feature_masks_sam3_batch
-from texture_face_segment import bake_feature_mask, debug_landmarks_image
+from texture_face_segment import FEATURE_GROUPS, bake_feature_mask, debug_landmarks_image
 from texture_segment import segment_texture
 
 # Defaults for this machine's GenieSAM checkout / SAM3 checkpoint / geniesam conda env —
@@ -48,11 +51,15 @@ _DEFAULT_GENIESAM_REPO = r"C:\Users\auror\Documents\Github\GenieSAM"
 _DEFAULT_SAM3_CHECKPOINT = r"C:\Users\auror\Documents\segmentation\sam3.pth"
 _DEFAULT_GENIESAM_PYTHON = r"C:\Users\auror\miniconda3\envs\geniesam\python.exe"
 
-# Combo label -> the feature group name(s) passed to bake_feature_mask.
+# Combo label -> the feature group name(s) passed to bake_feature_mask. "beard" has no
+# MediaPipe landmark group (see texture_face_segment.FEATURE_GROUPS), so it only works
+# through the SAM3 text-prompt backend — bake_feature_mask (the landmark-hull backend) would
+# KeyError on it.
 FEATURE_CHOICES = {
     "Lips": ("lips",),
     "Eyebrows": ("left_eyebrow", "right_eyebrow"),
     "Lips + eyebrows": ("lips", "left_eyebrow", "right_eyebrow"),
+    "Beard": ("beard",),
 }
 
 
@@ -80,13 +87,18 @@ class FeatureMaskWorker(QThread):
                     geniesam_repo=p["geniesam_repo"],
                     sam3_checkpoint=p["sam3_checkpoint"],
                     geniesam_python=p["geniesam_python"],
+                    beard_score_threshold=p["beard_score_threshold"],
                 )
             else:
                 mask = bake_feature_mask(texture, features=p["features"], feather_px=p["feather_px"])
             save_rgb(p["output_path"], mask)
 
+            # Only landmark-groupable features (see FEATURE_GROUPS) have a debug overlay to
+            # draw — "beard" has no MediaPipe connection set, so skip it in that case rather
+            # than KeyError inside debug_landmarks_image.
+            landmark_features = [f for f in p["features"] if f in FEATURE_GROUPS]
             landmarks_path = os.path.splitext(p["output_path"])[0] + "_landmarks.png"
-            landmarks_vis = debug_landmarks_image(texture, features=p["features"])
+            landmarks_vis = debug_landmarks_image(texture, features=landmark_features) if landmark_features else texture[..., :3]
             save_rgb(landmarks_path, landmarks_vis)
 
             result = {"output_path": p["output_path"], "landmarks_path": landmarks_path, "preview": mask}
@@ -152,6 +164,7 @@ class BatchFeatureMaskWorker(QThread):
                 geniesam_repo=p["geniesam_repo"],
                 sam3_checkpoint=p["sam3_checkpoint"],
                 geniesam_python=p["geniesam_python"],
+                beard_score_threshold=p["beard_score_threshold"],
                 on_crop_done=lambda i, n, path: self.fileDone.emit(i, n, f"Cropping {os.path.basename(path)}…"),
             )
         except Exception:
@@ -169,7 +182,7 @@ class BatchFeatureMaskWorker(QThread):
             name = os.path.basename(path)
             mask = results.get(path)
             if mask is None:
-                reason = "no face island found" if path in no_face_set else "no eyebrow/lip detected by SAM3"
+                reason = "no face island found" if path in no_face_set else "no requested feature detected by SAM3"
                 failures.append((name, reason))
                 print(f"[batch] skipped {name}: {reason}")
                 self.fileFailed.emit(i, total, name, reason)
@@ -229,6 +242,18 @@ class FeatureMaskPanel(QGroupBox):
         self.geniesam_python_edit = _path_row(
             sam3_form, "geniesam python.exe", _DEFAULT_GENIESAM_PYTHON, root=self._root, parent=self
         )
+        self.beard_threshold_checkbox = QCheckBox(
+            "Override beard score threshold (lower = catches more beard on low-contrast/dark skin textures)"
+        )
+        sam3_form.addRow(self.beard_threshold_checkbox)
+        self.beard_threshold = QDoubleSpinBox()
+        self.beard_threshold.setRange(0.0, 1.0)
+        self.beard_threshold.setSingleStep(0.05)
+        self.beard_threshold.setDecimals(2)
+        self.beard_threshold.setValue(0.8)
+        self.beard_threshold.setEnabled(False)
+        self.beard_threshold_checkbox.toggled.connect(self.beard_threshold.setEnabled)
+        sam3_form.addRow("Beard score threshold", self.beard_threshold)
         form.addRow(sam3_box)
 
         self.run_btn = QPushButton("Detect mask")
@@ -266,6 +291,7 @@ class FeatureMaskPanel(QGroupBox):
             geniesam_repo=geniesam_repo,
             sam3_checkpoint=sam3_checkpoint,
             geniesam_python=geniesam_python,
+            beard_score_threshold=self.beard_threshold.value() if self.beard_threshold_checkbox.isChecked() else None,
         )
 
     def _on_run(self) -> None:
@@ -282,6 +308,10 @@ class FeatureMaskPanel(QGroupBox):
         if sam3_params is None:
             return
         use_sam3 = sam3_params["use_sam3"]
+        features = FEATURE_CHOICES[self.feature_combo.currentText()]
+        if not use_sam3 and any(f not in FEATURE_GROUPS for f in features):
+            QMessageBox.warning(self, "Inputs", "This feature needs SAM3 — check “Use SAM3 text-prompt segmentation”.")
+            return
 
         self._job_id += 1
         job_id = self._job_id
@@ -292,7 +322,7 @@ class FeatureMaskPanel(QGroupBox):
             texture_path=texture_path,
             output_path=output_path,
             feather_px=self.feather.value(),
-            features=FEATURE_CHOICES[self.feature_combo.currentText()],
+            features=features,
             **sam3_params,
         )
         self._worker = FeatureMaskWorker(job_id, params, self)
@@ -329,6 +359,10 @@ class FeatureMaskPanel(QGroupBox):
         sam3_params = self._sam3_params()
         if sam3_params is None:
             return
+        features = FEATURE_CHOICES[self.feature_combo.currentText()]
+        if not sam3_params["use_sam3"] and any(f not in FEATURE_GROUPS for f in features):
+            QMessageBox.warning(self, "Inputs", "This feature needs SAM3 — check “Use SAM3 text-prompt segmentation”.")
+            return
 
         input_paths = list_images(input_dir)
         if not input_paths:
@@ -340,7 +374,7 @@ class FeatureMaskPanel(QGroupBox):
         self.run_btn.setEnabled(False)
         self.batch_bar.set_status(f"Processing 0/{len(input_paths)}…")
 
-        params = dict(feather_px=self.feather.value(), features=FEATURE_CHOICES[self.feature_combo.currentText()], **sam3_params)
+        params = dict(feather_px=self.feather.value(), features=features, **sam3_params)
         self._batch_worker = BatchFeatureMaskWorker(input_paths, params, output_dir, self)
         self._batch_worker.fileDone.connect(self._on_batch_file_done)
         self._batch_worker.fileFailed.connect(self._on_batch_file_failed)
@@ -520,17 +554,31 @@ class TextureSegmentationTab(QWidget):
 
         root_layout = QHBoxLayout(self)
 
-        controls = QWidget()
-        controls.setMinimumWidth(420)
-        controls.setMaximumWidth(520)
-        cl = QVBoxLayout(controls)
+        # Scrollable controls column — FeatureMaskPanel (SAM3 group + batch bar) plus
+        # SegmentPanel add up to more vertical space than the window reliably has, so without
+        # a scroll area Qt squashes everything to fit, occluding the SAM3 controls entirely.
+        # Mirrors MatteBlendPanel's own controls_scroll further down in this app.
+        controls_host = QWidget()
+        controls_host.setMinimumWidth(420)
+        controls_host.setMaximumWidth(520)
+        ch_layout = QVBoxLayout(controls_host)
+        ch_layout.setContentsMargins(0, 0, 0, 0)
+
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        controls_inner = QWidget()
+        cl = QVBoxLayout(controls_inner)
+        controls_scroll.setWidget(controls_inner)
+        ch_layout.addWidget(controls_scroll)
 
         self.feature_mask_panel = FeatureMaskPanel(root)
         self.segment_panel = SegmentPanel(root)
         cl.addWidget(self.feature_mask_panel)
         cl.addWidget(self.segment_panel)
         cl.addStretch(1)
-        root_layout.addWidget(controls)
+        root_layout.addWidget(controls_host)
 
         self.tabs = QTabWidget()
         self.result_viewer = ImageViewer()

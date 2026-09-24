@@ -35,6 +35,7 @@ _FEATURE_TO_CATEGORIES: Dict[str, List[str]] = {
     "lips": ["Upper Lip", "Lower Lip"],
     "left_eyebrow": ["Left Eyebrow"],
     "right_eyebrow": ["Right Eyebrow"],
+    "beard": ["Beard"],
 }
 
 Box = Tuple[int, int, int, int]
@@ -95,6 +96,10 @@ def _run_bridge(cmd: List[str]) -> None:
         raise RuntimeError(f"SAM3 bridge failed:\n{proc.stderr or proc.stdout}")
 
 
+def _beard_threshold_args(beard_score_threshold: Optional[float]) -> List[str]:
+    return ["--beard-score-threshold", str(beard_score_threshold)] if beard_score_threshold is not None else []
+
+
 def bake_feature_mask_sam3(
     texture: np.ndarray,
     features: Sequence[str],
@@ -105,6 +110,7 @@ def bake_feature_mask_sam3(
     geniesam_python: str,
     device: str = "cuda",
     image_size: int = 1008,
+    beard_score_threshold: Optional[float] = None,
 ) -> np.ndarray:
     """Finds the face island in a UV texture and rasterizes the requested features' mask via
     GenieSAM's SAM3 text-prompt segmentation, run out-of-process in the `geniesam` conda env.
@@ -115,6 +121,11 @@ def bake_feature_mask_sam3(
     replacement for bake_feature_mask's output, so texture_segment.segment_texture needs no
     changes to consume it. Raises ValueError if no face island is found, RuntimeError if the
     subprocess call into the geniesam env fails.
+
+    ``beard_score_threshold``, if given, overrides GenieSAM's own config.yaml beard_score for
+    this call only — lower it when "beard" detection is missing hair on darker skin textures
+    (SAM3's confidence there is naturally lower, since hair/skin color contrast is smaller).
+    Only affects the "beard" category; ignored for other features.
 
     For more than a handful of textures, use bake_feature_masks_sam3_batch instead — calling
     this in a loop reloads the ~3GB SAM3 checkpoint (a fresh subprocess) for every texture.
@@ -135,6 +146,7 @@ def bake_feature_mask_sam3(
             "--categories", *categories,
             "--device", device,
             "--image-size", str(image_size),
+            *_beard_threshold_args(beard_score_threshold),
         ])
         island_mask = _union_categories(out_dir, categories, crop.shape[:2])
 
@@ -151,12 +163,15 @@ def bake_feature_masks_sam3_batch(
     geniesam_python: str,
     device: str = "cuda",
     image_size: int = 1008,
+    beard_score_threshold: Optional[float] = None,
     on_crop_done: Optional[Callable[[int, int, str], None]] = None,
 ) -> Tuple[Dict[str, np.ndarray], List[str]]:
     """Batch counterpart to bake_feature_mask_sam3: crops every texture's face island, then
     runs ONE sam3_bridge.py subprocess (one SAM3 checkpoint load, reused for every texture)
     instead of one subprocess per texture — the checkpoint load is the dominant cost, so this
     is far faster than calling bake_feature_mask_sam3 in a loop for more than a couple files.
+
+    ``beard_score_threshold``: see bake_feature_mask_sam3 — applied to the whole batch.
 
     ``on_crop_done(index, total, texture_path)`` fires after each texture's crop step (which
     still runs one-by-one in this process, since it needs MediaPipe to pick the face island),
@@ -207,6 +222,7 @@ def bake_feature_masks_sam3_batch(
                 "--categories", *categories,
                 "--device", device,
                 "--image-size", str(image_size),
+                *_beard_threshold_args(beard_score_threshold),
             ])
             for stem, entry in entries.items():
                 island_mask = _union_categories(os.path.join(out_root, stem), categories, entry["crop_hw"])
