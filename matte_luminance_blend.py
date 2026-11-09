@@ -57,6 +57,12 @@ GATE_MODES = ("weight", "blue_paint", "color_id", "beard_color")
 # Default blur radius (px) for reconstructing the "self" diffuse target's
 # local shading gradient — see build_local_diffuse_target().
 DEFAULT_SELF_LOCALITY_RADIUS = 250.0
+# estimate_diffuse_color strides its clean pixels down to about this many before taking the median.
+_MEDIAN_MAX_PIXELS = 1_000_000
+# texture_skin_mask: Lab distance from the skin median that still counts as skin. On the
+# packed-head layout ~70% of pixels sit under 7.5 and every other material (hair, lashes,
+# the pale lower islands) starts above 15, so anything in between separates them.
+DEFAULT_TEXTURE_SKIN_CUTOFF = 12.0
 
 
 # =============================================================================
@@ -319,7 +325,7 @@ def sample_palette_skin_rgb(
     if not np.any(keep):
         raise ValueError("Could not sample skin from diffuse palette (no non-background pixels).")
     skin = palette_img[keep].astype(np.float32)
-    mean = skin.mean(axis=0)
+    mean = skin.mean(axis=0, dtype=np.float64).astype(np.float32)
     logger.info(
         "Detected palette background ≈ (%.0f, %.0f, %.0f); skin RGB ≈ (%.1f, %.1f, %.1f) from %d pixels",
         bg_color[0], bg_color[1], bg_color[2], mean[0], mean[1], mean[2], int(keep.sum()),
@@ -360,13 +366,18 @@ def estimate_diffuse_color(
     exclude_gate: np.ndarray,
     bg_threshold: float = 8.0,
 ) -> np.ndarray:
-    """Mean RGB (float32, shape (3,)) of the sample's clean pixels outside ``exclude_gate``.
+    """Per-channel median RGB (float32, shape (3,)) of the sample's clean pixels outside ``exclude_gate``.
 
     This is the flat color ``build_local_diffuse_target(..., flat=True)``
     broadcasts across the frame, and the value ``flat_fill`` channels and
     ``--diffuse-mode self`` are centered on — surfaced as its own function so
     UI layers can show/let the user override it without re-deriving the same
     "clean pixel" selection logic.
+
+    A median rather than a mean: the flat body islands dominate the texture, so contrasting
+    face patches (brows, lips, painted shading, stubble) are outvoted instead of dragging the
+    color. Over 605 authored albedos it lands within median dE 0.6 of the flat body tone,
+    vs 1.3 for the mean.
     """
     lum = luminance(sample)
     valid = (lum > bg_threshold) & (exclude_gate <= 0.5)
@@ -376,7 +387,52 @@ def estimate_diffuse_color(
             "enabled channel masks / feature-preserve mask. Loosen those "
             "masks or use --diffuse-mode uv/palette instead."
         )
-    return sample.astype(np.float32)[valid].mean(axis=0)
+    px = sample[valid]
+    # A 4K texture has ~16M clean pixels; an even stride down to ~1M gives the same median
+    # (to well under a level) in a fraction of the time.
+    step = max(1, len(px) // _MEDIAN_MAX_PIXELS)
+    return np.median(px[::step, :3], axis=0).astype(np.float32)
+
+
+def texture_skin_mask(
+    sample: np.ndarray,
+    skin_rgb: np.ndarray,
+    cutoff: float = DEFAULT_TEXTURE_SKIN_CUTOFF,
+    protect: Optional[np.ndarray] = None,
+    feather_px: float = 3.0,
+    bg_threshold: float = 8.0,
+) -> np.ndarray:
+    """Soft (0-1 float32) mask of the pixels that are skin, judged only by ``sample``'s own colors.
+
+    Used by the "texture" diffuse mode, which flat-fills this mask with ``skin_rgb`` instead of
+    running the mask channels — those are authored for one UV layout, and on any other layout
+    they land (and blur) in the wrong places. Nothing here depends on the layout:
+
+    * Skin is every pixel within ``cutoff`` (Lab) of ``skin_rgb``, with lightness weighted half
+      so painted shading and highlights still count as skin while other materials don't.
+    * Thin runs of skin-colored pixels far from the main skin area (e.g. a stripe inside a
+      clothing island) are dropped by an opening ~2% of the texture wide; skin within that
+      distance of a large region (around eyes, lashes, the hairline) is kept.
+    * ``protect`` (0-1, e.g. a landmark lips/nose mask) is cut out, so features whose color is
+      close to the skin's — dark lips on dark skin — survive the fill.
+    """
+    lab = cv2.cvtColor(sample[..., :3].astype(np.float32) / 255.0, cv2.COLOR_RGB2Lab)
+    ref = cv2.cvtColor(np.asarray(skin_rgb, np.float32).reshape(1, 1, 3) / 255.0, cv2.COLOR_RGB2Lab)[0, 0]
+    d = lab - ref
+    dist = np.sqrt((0.5 * d[..., 0]) ** 2 + d[..., 1] ** 2 + d[..., 2] ** 2)
+    skin = ((dist < cutoff) & (luminance(sample) > bg_threshold)).astype(np.uint8)
+
+    k = max(3, int(round(0.02 * min(skin.shape))) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    core = cv2.morphologyEx(skin, cv2.MORPH_OPEN, kernel)
+    skin = skin & cv2.dilate(core, kernel)
+
+    mask = skin.astype(np.float32)
+    if feather_px > 0:
+        mask = cv2.GaussianBlur(mask, (0, 0), feather_px)
+    if protect is not None:
+        mask *= 1.0 - np.clip(protect, 0.0, 1.0)
+    return mask
 
 
 def estimate_own_mask_color(
@@ -403,7 +459,7 @@ def estimate_own_mask_color(
         )
     w = gate[valid].astype(np.float32)
     px = sample.astype(np.float32)[valid]
-    return (px * w[:, None]).sum(axis=0) / w.sum()
+    return ((px * w[:, None]).sum(axis=0, dtype=np.float64) / w.sum(dtype=np.float64)).astype(np.float32)
 
 
 def resolve_diffuse_color(
@@ -448,7 +504,7 @@ def build_local_diffuse_target(
     the same shape.
 
     ``flat=True`` skips that and returns ``estimate_diffuse_color``'s plain
-    mean of the clean pixels, broadcast to full size — for callers
+    median of the clean pixels, broadcast to full size — for callers
     (``flat_fill`` channels) that explicitly want one uniform fill color
     rather than a shape-following reconstruction, e.g. a small feature
     (eyebrows/lips) where there isn't enough local shading gradient around it
@@ -460,11 +516,11 @@ def build_local_diffuse_target(
     blur runs on a downsampled copy and is upsampled back afterward.
     """
     if flat:
-        mean = estimate_diffuse_color(sample, exclude_gate, bg_threshold)
+        median = estimate_diffuse_color(sample, exclude_gate, bg_threshold)
         logger.info(
-            "Flat self-fill target: mean skin RGB ≈ (%.1f, %.1f, %.1f)", mean[0], mean[1], mean[2],
+            "Flat self-fill target: median skin RGB ≈ (%.1f, %.1f, %.1f)", median[0], median[1], median[2],
         )
-        return np.broadcast_to(mean, sample.shape).astype(np.float32).copy()
+        return np.broadcast_to(median, sample.shape).astype(np.float32).copy()
 
     lum = luminance(sample)
     valid = (lum > bg_threshold) & (exclude_gate <= 0.5)

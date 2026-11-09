@@ -46,12 +46,14 @@ from PyQt6.QtWidgets import (
 from matte_luminance_blend import (
     DEFAULT_REGION_PALETTE,
     DEFAULT_SELF_LOCALITY_RADIUS,
+    DEFAULT_TEXTURE_SKIN_CUTOFF,
     GATE_MODES,
     MaskChannel,
     build_local_diffuse_target,
     composite_skin_envelope,
     composite_weights,
     compute_channel_gate,
+    estimate_diffuse_color,
     estimate_own_mask_color,
     load_combined_weight_mask,
     load_rgb,
@@ -60,8 +62,12 @@ from matte_luminance_blend import (
     resolve_diffuse_color,
     run_channel_pipeline,
     save_rgb,
+    texture_skin_mask,
 )
+from diffuse_sheet import resolve_sheet_skin
+from gap_skin_sample import sample_gap_skin_color
 from texture_edit import apply_exposure_gamma
+from texture_face_segment import bake_feature_mask
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 
@@ -793,6 +799,9 @@ def _process_texture(params: dict, write_outputs: bool) -> Dict[str, Any]:
     channels: List[MaskChannel] = p["channels"]
     active = [ch for ch in channels if ch.enabled]
 
+    if p["diffuse_mode"] == "texture":
+        return _process_texture_median_fill(p, write_outputs)
+
     mask_imgs: Dict[str, np.ndarray] = {}
     for ch in active:
         nearest = ch.gate_mode in ("blue_paint", "color_id")
@@ -809,21 +818,41 @@ def _process_texture(params: dict, write_outputs: bool) -> Dict[str, Any]:
     if feature_preserve is not None:
         exclude = np.maximum(exclude, feature_preserve)
 
-    diffuse_color_override = p.get("diffuse_color_override")
+    # "sheet" mode resolves to one flat color per texture (its asset's diffuse avatar sheet),
+    # which then behaves exactly like an override: diffuse target, flat-fill target and the
+    # reported diffuse color. Textures with no sheet fall back to gap-core's skin sample (the
+    # autorigger's forehead/scalp region), or failing that the flat median of their own clean
+    # skin pixels (outside every mask), used the same way, with a note.
+    diffuse_mode = p["diffuse_mode"]
+    diffuse_note: Optional[str] = None
+    flat_color = p.get("diffuse_color_override")
+    if flat_color is None and diffuse_mode == "sheet":
+        try:
+            skin = resolve_sheet_skin(p["texture_path"], p["diffuse_sheets_dir"])
+            flat_color = skin.rgb
+            diffuse_note = ("Review — " if skin.flagged else "") + skin.summary()
+        except LookupError as exc:
+            try:
+                flat_color = sample_gap_skin_color(sample)
+                diffuse_note = f"{exc} Fell back to gap-core's skin sample."
+            except Exception as gap_exc:  # missing checkout, pxr, or an empty region
+                flat_color = estimate_diffuse_color(sample, exclude)
+                diffuse_note = f"{exc} Fell back to the texture's median color ({gap_exc})"
+    if diffuse_mode == "sheet":
+        diffuse_mode = "self"
+
     diffuse_img = None
-    if diffuse_color_override is not None:
-        diffuse_target = np.broadcast_to(
-            np.asarray(diffuse_color_override, dtype=np.float32), sample.shape
-        ).copy()
-    elif p["diffuse_mode"] == "self":
+    if flat_color is not None:
+        diffuse_target = np.broadcast_to(np.asarray(flat_color, dtype=np.float32), sample.shape).copy()
+    elif diffuse_mode == "self":
         diffuse_target = build_local_diffuse_target(sample, exclude, p["self_locality_radius"])
     else:
         diffuse_img = load_rgb(p["diffuse_path"])
-        diffuse_target = make_diffuse_target(sample, diffuse_img, p["diffuse_mode"])
+        diffuse_target = make_diffuse_target(sample, diffuse_img, diffuse_mode)
 
     flat_target = None
     if any(ch.flat_fill for ch in active):
-        if diffuse_color_override is not None:
+        if flat_color is not None:
             flat_target = diffuse_target
         else:
             flat_target = build_local_diffuse_target(sample, exclude, p["self_locality_radius"], flat=True)
@@ -841,16 +870,74 @@ def _process_texture(params: dict, write_outputs: bool) -> Dict[str, Any]:
             color = estimate_own_mask_color(sample, gate)
             own_mask_targets[ch.name] = np.broadcast_to(color, sample.shape).astype(np.float32).copy()
 
-    if diffuse_color_override is not None:
-        diffuse_color = np.asarray(diffuse_color_override, dtype=np.float32)
+    if flat_color is not None:
+        diffuse_color = np.asarray(flat_color, dtype=np.float32)
     else:
-        diffuse_color = resolve_diffuse_color(sample, p["diffuse_mode"], exclude, diffuse_img)
+        diffuse_color = resolve_diffuse_color(sample, diffuse_mode, exclude, diffuse_img)
 
     working, soft_masks = run_channel_pipeline(
         sample, diffuse_target, mask_imgs, active, palette, p["luminance_only"], feature_preserve, flat_target,
         own_mask_targets,
     )
 
+    return _finish_result(p, working, soft_masks, diffuse_color, diffuse_note, write_outputs)
+
+
+# Landmark protect masks per (texture path, features): FaceMesh takes a second or so, and the
+# live preview re-runs on every slider change.
+_PROTECT_MASK_CACHE: Dict[Tuple[str, Tuple[int, int], Tuple[str, ...]], Optional[np.ndarray]] = {}
+
+
+def _face_protect_mask(texture_path: str, sample: np.ndarray, features: Tuple[str, ...]) -> Optional[np.ndarray]:
+    """0-1 landmark mask of ``features`` on ``sample``, or None if no face is found."""
+    key = (texture_path, sample.shape[:2], features)
+    if key not in _PROTECT_MASK_CACHE:
+        try:
+            _PROTECT_MASK_CACHE[key] = bake_feature_mask(sample, features).astype(np.float32) / 255.0
+        except ValueError:
+            _PROTECT_MASK_CACHE[key] = None
+    return _PROTECT_MASK_CACHE[key]
+
+
+def _process_texture_median_fill(p: dict, write_outputs: bool) -> Dict[str, Any]:
+    """"texture" diffuse mode: flat-fill the texture's own skin with its own median color.
+
+    Ignores the mask channels — they're authored for one UV layout and land in the wrong
+    places on any other — and finds the skin from the texture's colors instead (see
+    ``texture_skin_mask``), so it works on any layout.
+    """
+    sample: np.ndarray = p["sample"]
+    override = p.get("diffuse_color_override")
+    if override is not None:
+        color = np.asarray(override, dtype=np.float32)
+    else:
+        color = estimate_diffuse_color(sample, np.zeros(sample.shape[:2], dtype=np.float32))
+
+    protect = None
+    note_parts = []
+    features = tuple(p.get("texture_protect_features") or ())
+    if features:
+        protect = _face_protect_mask(p.get("texture_path", ""), sample, features)
+        if protect is None:
+            note_parts.append(f"Review — no face found, {'/'.join(features)} not protected.")
+
+    skin = texture_skin_mask(sample, color, p.get("texture_skin_cutoff", DEFAULT_TEXTURE_SKIN_CUTOFF), protect)
+    working = sample.astype(np.float32) * (1.0 - skin[..., None]) + color * skin[..., None]
+    working = np.clip(working + 0.5, 0, 255).astype(np.uint8)
+    note_parts.append(f"Texture median fill over {skin.mean() * 100:.0f}% of the texture (mask channels ignored).")
+    return _finish_result(p, working, {"texture_skin": skin}, color, " ".join(note_parts), write_outputs)
+
+
+def _finish_result(
+    p: dict,
+    working: np.ndarray,
+    soft_masks: Dict[str, np.ndarray],
+    diffuse_color: Optional[np.ndarray],
+    diffuse_note: Optional[str],
+    write_outputs: bool,
+) -> Dict[str, Any]:
+    """Post-process (exposure/gamma), package the result, and write it out if asked."""
+    sample: np.ndarray = p["sample"]
     exposure, gamma, shadow_bias = p["exposure"], p["gamma"], p["shadow_bias"]
     if exposure != 0.0 or gamma != 1.0 or shadow_bias != 0.0:
         working = apply_exposure_gamma(working, exposure=exposure, gamma=gamma, shadow_bias=shadow_bias)
@@ -864,6 +951,7 @@ def _process_texture(params: dict, write_outputs: bool) -> Dict[str, Any]:
         "sample": sample,
         "channel_masks": channel_masks,
         "diffuse_color": diffuse_color,
+        "diffuse_note": diffuse_note,
     }
 
     if write_outputs:
@@ -928,6 +1016,9 @@ class BatchWorker(QThread):
         self.input_paths = input_paths
         self.output_dir = output_dir
         self.base_params = base_params
+        # (filename, note) for files whose diffuse color fell back or needs review — read by
+        # the panel once batchFinished fires.
+        self.diffuse_notes: List[Tuple[str, str]] = []
 
     def run(self) -> None:
         total = len(self.input_paths)
@@ -938,11 +1029,16 @@ class BatchWorker(QThread):
             try:
                 params = dict(self.base_params)
                 params["sample"] = load_rgb(path)
+                params["texture_path"] = path
                 params["out_texture_path"] = os.path.join(self.output_dir, name)
                 if params.get("out_masks_dir"):
                     stem = os.path.splitext(name)[0]
                     params["out_masks_dir"] = os.path.join(self.output_dir, "channel_masks", stem)
-                _process_texture(params, write_outputs=True)
+                result = _process_texture(params, write_outputs=True)
+                note = result.get("diffuse_note")
+                if note and ("Fell back" in note or note.startswith("Review")):
+                    self.diffuse_notes.append((name, note))
+                    print(f"[batch] {name}: {note}")
                 ok_count += 1
                 self.fileDone.emit(i, total, name)
             except Exception:
@@ -1144,9 +1240,52 @@ class MatteBlendPanel(QWidget):
         )
 
         self.diffuse_mode = QComboBox()
-        self.diffuse_mode.addItems(["self", "uv", "palette"])
+        self.diffuse_mode.addItems(["self", "uv", "palette", "sheet", "texture"])
+        self.diffuse_mode.setToolTip(
+            "sheet: per texture, sample the flat skin color from its asset's 2x2 diffuse avatar "
+            "sheet in the folder below (matched by ethnicity/gender/number). Textures without a "
+            "sheet fall back to gap-core's forehead/scalp skin sample, else their median color.\n"
+            "texture: flat-fill the texture's own skin with its own median color. The skin is "
+            "found from the texture's colors, not the mask channels (which are ignored), so it "
+            "works on any UV layout."
+        )
         self.diffuse_mode.currentIndexChanged.connect(self._on_inputs_changed)
+        self.diffuse_mode.currentIndexChanged.connect(self._update_diffuse_rows)
         io.addRow("Diffuse mode", self.diffuse_mode)
+
+        self.sheets_dir_edit = self._path_row(io, "Diffuse sheets folder", "", invalidate=True, is_dir=True)
+        self.sheets_dir_edit.setToolTip(
+            "Root of the generator runs (e.g. reproject_textures): <ethnicity>/<run>/*.png with "
+            "Payload/payload.json naming the source asset."
+        )
+        self.texture_skin_cutoff = _SliderSpin(
+            2.0, 40.0, DEFAULT_TEXTURE_SKIN_CUTOFF, step=0.5, decimals=1, slider_scale=10
+        )
+        self.texture_skin_cutoff.setToolTip(
+            "How far (Lab) a pixel's color may be from the median and still be filled as skin. "
+            "Raise it if shaded skin is left unfilled; lower it if lips/brows/hair get filled."
+        )
+        self.texture_skin_cutoff.valueChanged.connect(self._schedule_live_preview)
+        io.addRow("Skin color cutoff", self.texture_skin_cutoff)
+
+        self.chk_protect_lips = QCheckBox("Lips")
+        self.chk_protect_lips.setChecked(True)
+        self.chk_protect_nose = QCheckBox("Nose")
+        protect_row = QWidget()
+        prl = QHBoxLayout(protect_row)
+        prl.setContentsMargins(0, 0, 0, 0)
+        prl.addWidget(self.chk_protect_lips)
+        prl.addWidget(self.chk_protect_nose)
+        prl.addStretch(1)
+        protect_row.setToolTip(
+            "Keep these features out of the fill, located with face landmarks on the texture "
+            "itself. Needed for lips on darker skin, whose color is close to the skin's."
+        )
+        for chk in (self.chk_protect_lips, self.chk_protect_nose):
+            chk.toggled.connect(self._schedule_live_preview)
+        io.addRow("Protect from fill", protect_row)
+        self._protect_row = protect_row
+        self._io_form = io
 
         self.self_locality_radius = _SliderSpin(
             8.0, 800.0, DEFAULT_SELF_LOCALITY_RADIUS, step=2.0, decimals=0, slider_scale=1
@@ -1167,6 +1306,7 @@ class MatteBlendPanel(QWidget):
         add_btn.clicked.connect(self._add_channel_dialog)
         self.channels_layout.addWidget(add_btn)
         self._controls_layout.addWidget(self.channels_box)
+        self._update_diffuse_rows()
 
         # --- Shared options ---------------------------------------------------
         shared_box = QGroupBox("Shared options")
@@ -1273,8 +1413,12 @@ class MatteBlendPanel(QWidget):
             "version": 1,
             "diffuse_path": self.diffuse_edit.text().strip(),
             "diffuse_mode": self.diffuse_mode.currentText(),
+            "diffuse_sheets_dir": self.sheets_dir_edit.text().strip(),
             "feature_preserve_path": self.feature_edit.text().strip(),
             "self_locality_radius": self.self_locality_radius.value(),
+            "texture_skin_cutoff": self.texture_skin_cutoff.value(),
+            "texture_protect_lips": self.chk_protect_lips.isChecked(),
+            "texture_protect_nose": self.chk_protect_nose.isChecked(),
             "diffuse_color_override_enabled": self.diffuse_color_row.is_override_enabled(),
             "diffuse_color_override": list(override_color),
             "luminance_only": self.chk_luma_only.isChecked(),
@@ -1292,9 +1436,17 @@ class MatteBlendPanel(QWidget):
         mode = data.get("diffuse_mode")
         if mode:
             self.diffuse_mode.setCurrentText(mode)
+        if "diffuse_sheets_dir" in data:
+            self.sheets_dir_edit.setText(data["diffuse_sheets_dir"])
         self.feature_edit.setText(data.get("feature_preserve_path", ""))
         if "self_locality_radius" in data:
             self.self_locality_radius.setValue(data["self_locality_radius"])
+        if "texture_skin_cutoff" in data:
+            self.texture_skin_cutoff.setValue(data["texture_skin_cutoff"])
+        if "texture_protect_lips" in data:
+            self.chk_protect_lips.setChecked(bool(data["texture_protect_lips"]))
+        if "texture_protect_nose" in data:
+            self.chk_protect_nose.setChecked(bool(data["texture_protect_nose"]))
 
         color = data.get("diffuse_color_override")
         enabled = bool(data.get("diffuse_color_override_enabled", False))
@@ -1447,6 +1599,20 @@ class MatteBlendPanel(QWidget):
         self._sample_cache = None
         self._schedule_live_preview()
 
+    def _update_diffuse_rows(self, *_args) -> None:
+        """Shows only the input rows the current diffuse mode uses: the sheets folder in 'sheet'
+        mode, the skin cutoff/protect rows (and no mask channels) in 'texture' mode, else the
+        "Diffuse" image row.
+        """
+        mode = self.diffuse_mode.currentText()
+        self._io_form.setRowVisible(self.diffuse_edit.parentWidget(), mode not in ("sheet", "texture"))
+        self._io_form.setRowVisible(self.sheets_dir_edit.parentWidget(), mode == "sheet")
+        self._io_form.setRowVisible(self.texture_skin_cutoff, mode == "texture")
+        self._io_form.setRowVisible(self._protect_row, mode == "texture")
+        self._io_form.setRowVisible(self.self_locality_radius, mode != "texture")
+        self.channels_box.setEnabled(mode != "texture")
+        self.channels_box.setTitle("Mask channels" + (" (ignored in texture mode)" if mode == "texture" else ""))
+
     def _schedule_live_preview(self, *_args) -> None:
         if not self.chk_live.isChecked():
             return
@@ -1511,17 +1677,31 @@ class MatteBlendPanel(QWidget):
             return None
 
     # -- process -------------------------------------------------------------
+    @staticmethod
+    def _validate_diffuse_inputs(
+        diffuse_mode: str, diffuse: str, sheets_dir: str, override: Optional[Tuple[float, float, float]]
+    ) -> None:
+        if override is not None or diffuse_mode in ("self", "texture"):
+            return
+        if diffuse_mode == "sheet":
+            if not sheets_dir or not os.path.isdir(sheets_dir):
+                raise FileNotFoundError(
+                    "Select the diffuse sheets folder, switch diffuse mode, or enable a diffuse color override."
+                )
+        elif not diffuse or not os.path.isfile(diffuse):
+            raise FileNotFoundError(
+                "Select a valid diffuse image, switch diffuse mode to 'self', or enable a diffuse color override."
+            )
+
     def _gather_params(self) -> dict:
         texture = self.texture_edit.text().strip()
         diffuse = self.diffuse_edit.text().strip()
         diffuse_mode = self.diffuse_mode.currentText()
+        sheets_dir = self.sheets_dir_edit.text().strip()
         diffuse_color_override = self.diffuse_color_row.override_color()
         if not texture or not os.path.isfile(texture):
             raise FileNotFoundError("Select a valid texture (albedo) image.")
-        if diffuse_mode != "self" and diffuse_color_override is None and (not diffuse or not os.path.isfile(diffuse)):
-            raise FileNotFoundError(
-                "Select a valid diffuse image, switch diffuse mode to 'self', or enable a diffuse color override."
-            )
+        self._validate_diffuse_inputs(diffuse_mode, diffuse, sheets_dir, diffuse_color_override)
 
         feature = self.feature_edit.text().strip() or None
         _validate_feature_preserve_paths(feature)
@@ -1529,7 +1709,7 @@ class MatteBlendPanel(QWidget):
         channels: List[MaskChannel] = []
         for panel in self._channel_panels:
             ch = panel.to_channel()
-            if ch.enabled:
+            if ch.enabled and diffuse_mode != "texture":
                 if not ch.mask_path or not os.path.isfile(ch.mask_path):
                     raise FileNotFoundError(f"Mask file not found for channel '{ch.name}': {ch.mask_path}")
             channels.append(ch)
@@ -1538,11 +1718,14 @@ class MatteBlendPanel(QWidget):
 
         return dict(
             sample=sample,
+            texture_path=texture,
             channels=channels,
             diffuse_path=diffuse,
             diffuse_mode=diffuse_mode,
+            diffuse_sheets_dir=sheets_dir,
             diffuse_color_override=diffuse_color_override,
             self_locality_radius=self.self_locality_radius.value(),
+            **self._texture_mode_params(),
             feature_preserve_path=feature,
             luminance_only=self.chk_luma_only.isChecked(),
             exposure=self.exposure.value(),
@@ -1559,11 +1742,9 @@ class MatteBlendPanel(QWidget):
         """
         diffuse = self.diffuse_edit.text().strip()
         diffuse_mode = self.diffuse_mode.currentText()
+        sheets_dir = self.sheets_dir_edit.text().strip()
         diffuse_color_override = self.diffuse_color_row.override_color()
-        if diffuse_mode != "self" and diffuse_color_override is None and (not diffuse or not os.path.isfile(diffuse)):
-            raise FileNotFoundError(
-                "Select a valid diffuse image, switch diffuse mode to 'self', or enable a diffuse color override."
-            )
+        self._validate_diffuse_inputs(diffuse_mode, diffuse, sheets_dir, diffuse_color_override)
 
         feature = self.feature_edit.text().strip() or None
         _validate_feature_preserve_paths(feature)
@@ -1571,7 +1752,7 @@ class MatteBlendPanel(QWidget):
         channels: List[MaskChannel] = []
         for panel in self._channel_panels:
             ch = panel.to_channel()
-            if ch.enabled:
+            if ch.enabled and diffuse_mode != "texture":
                 if not ch.mask_path or not os.path.isfile(ch.mask_path):
                     raise FileNotFoundError(f"Mask file not found for channel '{ch.name}': {ch.mask_path}")
             channels.append(ch)
@@ -1580,8 +1761,10 @@ class MatteBlendPanel(QWidget):
             channels=channels,
             diffuse_path=diffuse,
             diffuse_mode=diffuse_mode,
+            diffuse_sheets_dir=sheets_dir,
             diffuse_color_override=diffuse_color_override,
             self_locality_radius=self.self_locality_radius.value(),
+            **self._texture_mode_params(),
             feature_preserve_path=feature,
             luminance_only=self.chk_luma_only.isChecked(),
             exposure=self.exposure.value(),
@@ -1589,6 +1772,12 @@ class MatteBlendPanel(QWidget):
             shadow_bias=self.shadow_bias.value(),
             out_masks_dir=self.out_masks_dir.text().strip() or None,
         )
+
+    def _texture_mode_params(self) -> dict:
+        features = tuple(
+            name for name, chk in (("lips", self.chk_protect_lips), ("nose", self.chk_protect_nose)) if chk.isChecked()
+        )
+        return dict(texture_skin_cutoff=self.texture_skin_cutoff.value(), texture_protect_features=features)
 
     def _on_run_batch(self) -> None:
         input_dir = self.batch_bar.input_dir()
@@ -1633,9 +1822,17 @@ class MatteBlendPanel(QWidget):
         self.run_btn.setEnabled(True)
         if failures:
             names = ", ".join(name for name, _ in failures)
-            self.batch_bar.set_status(f"Batch done: {ok_count}/{total} saved. Failed: {names} (see console).")
+            status = f"Batch done: {ok_count}/{total} saved. Failed: {names} (see console)."
         else:
-            self.batch_bar.set_status(f"Batch done: {ok_count}/{total} saved.")
+            status = f"Batch done: {ok_count}/{total} saved."
+        notes = self._batch_worker.diffuse_notes if self._batch_worker else []
+        if notes:
+            fell_back = sum("Fell back" in note for _, note in notes)
+            status += (
+                f"\nDiffuse sheet: {fell_back} without a sheet (used gap-core skin sample), "
+                f"{len(notes) - fell_back} flagged for review — listed in console."
+            )
+        self.batch_bar.set_status(status)
 
     def _start_job(self, params: dict, write_outputs: bool) -> None:
         if self._worker and self._worker.isRunning():
@@ -1695,10 +1892,13 @@ class MatteBlendPanel(QWidget):
             mask_paths = [v for k, v in paths.items() if k.startswith("mask:")]
             if mask_paths:
                 lines.append(f"Channel masks → {os.path.dirname(mask_paths[0])}")
+            if result.get("diffuse_note"):
+                lines.append(f"Diffuse: {result['diffuse_note']}")
             self.status.setText("\n".join(lines))
             self.tabs.setCurrentIndex(0)
         else:
-            self.status.setText("Live preview updated.")
+            note = result.get("diffuse_note")
+            self.status.setText(f"Live preview updated.\nDiffuse: {note}" if note else "Live preview updated.")
 
         pending = self._pending_run
         self._pending_run = None

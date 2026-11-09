@@ -38,6 +38,9 @@ _FEATURE_CONNECTION_ATTRS = {
     "lips": "FACEMESH_LIPS",
     "left_eyebrow": "FACEMESH_LEFT_EYEBROW",
     "right_eyebrow": "FACEMESH_RIGHT_EYEBROW",
+    # Not in FEATURE_GROUPS (the multiview tab lists those); bake_feature_mask accepts it for
+    # the matte tool's "texture" diffuse mode, which protects the nose from its flat fill.
+    "nose": "FACEMESH_NOSE",
 }
 # Debug-visualization colors only (RGB) — unrelated to the mask math above.
 _FEATURE_COLORS = {

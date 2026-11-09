@@ -43,6 +43,14 @@ def _parse_args() -> argparse.Namespace:
              "beard on textures where hair/skin color contrast is low (e.g. darker skin tones), "
              "at the cost of more false positives. Defaults to the GenieSAM config's own value.",
     )
+    p.add_argument(
+        "--eyebrow-score-threshold",
+        type=float,
+        default=None,
+        help="Score threshold (0-1) for Left/Right Eyebrow only, replacing config.yaml's global "
+             "score threshold for those two categories. Lower catches faint/low-contrast painted "
+             "brows (e.g. lighter textures), at the cost of more false positives.",
+    )
     args = p.parse_args()
     if args.image and not args.output_dir:
         p.error("--image requires --output-dir")
@@ -55,12 +63,37 @@ def _safe_filename(category: str) -> str:
     return "".join(c if c.isalnum() else "_" for c in category) + ".png"
 
 
+def _install_category_thresholds(seg_module, overrides: dict) -> None:
+    """Gives each category in ``overrides`` its own score threshold, in place of the global one.
+
+    GenieSAM's segment_image drops any category scoring below the global score_threshold
+    BEFORE its beard-specific check, so a per-category threshold below the global one never
+    takes effect through its own arguments (e.g. beard_score_threshold=0.6 with score=0.8
+    still drops a 0.7 beard). Wrapping segment_with_text — which segment_image looks up as a
+    module global — to report pass/fail scores for the overridden categories keeps everything
+    in one segment_image call, so GenieSAM's cross-category post-processing is unchanged.
+    """
+    if not overrides:
+        return
+    base = seg_module.segment_with_text
+
+    def segment_with_text(model, backbone_out, text_prompt, device, image_size):
+        mask, score = base(model, backbone_out, text_prompt, device, image_size)
+        threshold = overrides.get(text_prompt)
+        if threshold is not None:
+            score = 1.0 if score >= threshold else 0.0
+        return mask, score
+
+    seg_module.segment_with_text = segment_with_text
+
+
 def main() -> int:
     args = _parse_args()
     sys.path.insert(0, args.geniesam_repo)
 
     import cv2
     import torch
+    import segmentation.segmentation as seg_module
     from config_loader import get_config
     from segmentation.segmentation import load_image, load_sam3_model, resize_masks_to_image, segment_image
 
@@ -75,9 +108,13 @@ def main() -> int:
 
     model, image_transform = load_sam3_model(args.device, args.image_size, sam3_ckpt=args.checkpoint)
     cfg = get_config()
-    beard_score_threshold = (
-        args.beard_score_threshold if args.beard_score_threshold is not None else cfg.beard_score_threshold
-    )
+    beard_score_threshold = cfg.beard_score_threshold
+    overrides = {}
+    if args.beard_score_threshold is not None:
+        overrides["Beard"] = args.beard_score_threshold
+    if args.eyebrow_score_threshold is not None:
+        overrides["Left Eyebrow"] = overrides["Right Eyebrow"] = args.eyebrow_score_threshold
+    _install_category_thresholds(seg_module, overrides)
 
     def segment_one(image_path: str, out_dir: str) -> list:
         image_np = load_image(image_path)

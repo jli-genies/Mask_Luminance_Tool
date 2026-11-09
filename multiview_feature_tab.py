@@ -88,6 +88,7 @@ class FeatureMaskWorker(QThread):
                     sam3_checkpoint=p["sam3_checkpoint"],
                     geniesam_python=p["geniesam_python"],
                     beard_score_threshold=p["beard_score_threshold"],
+                    eyebrow_score_threshold=p["eyebrow_score_threshold"],
                 )
             else:
                 mask = bake_feature_mask(texture, features=p["features"], feather_px=p["feather_px"])
@@ -165,6 +166,7 @@ class BatchFeatureMaskWorker(QThread):
                 sam3_checkpoint=p["sam3_checkpoint"],
                 geniesam_python=p["geniesam_python"],
                 beard_score_threshold=p["beard_score_threshold"],
+                eyebrow_score_threshold=p["eyebrow_score_threshold"],
                 on_crop_done=lambda i, n, path: self.fileDone.emit(i, n, f"Cropping {os.path.basename(path)}…"),
             )
         except Exception:
@@ -204,6 +206,7 @@ class FeatureMaskPanel(QGroupBox):
 
     maskBaked = pyqtSignal(str)
     landmarksBaked = pyqtSignal(str)
+    batchMasksBaked = pyqtSignal(str)  # batch output folder of per-texture masks
 
     def __init__(self, root: str, parent: Optional[QWidget] = None) -> None:
         super().__init__("1. Detect feature mask (from texture)", parent)
@@ -254,6 +257,18 @@ class FeatureMaskPanel(QGroupBox):
         self.beard_threshold.setEnabled(False)
         self.beard_threshold_checkbox.toggled.connect(self.beard_threshold.setEnabled)
         sam3_form.addRow("Beard score threshold", self.beard_threshold)
+        self.eyebrow_threshold_checkbox = QCheckBox(
+            "Override eyebrow score threshold (lower = catches faint/low-contrast brows on lighter textures)"
+        )
+        sam3_form.addRow(self.eyebrow_threshold_checkbox)
+        self.eyebrow_threshold = QDoubleSpinBox()
+        self.eyebrow_threshold.setRange(0.0, 1.0)
+        self.eyebrow_threshold.setSingleStep(0.05)
+        self.eyebrow_threshold.setDecimals(2)
+        self.eyebrow_threshold.setValue(0.7)
+        self.eyebrow_threshold.setEnabled(False)
+        self.eyebrow_threshold_checkbox.toggled.connect(self.eyebrow_threshold.setEnabled)
+        sam3_form.addRow("Eyebrow score threshold", self.eyebrow_threshold)
         form.addRow(sam3_box)
 
         self.run_btn = QPushButton("Detect mask")
@@ -292,6 +307,9 @@ class FeatureMaskPanel(QGroupBox):
             sam3_checkpoint=sam3_checkpoint,
             geniesam_python=geniesam_python,
             beard_score_threshold=self.beard_threshold.value() if self.beard_threshold_checkbox.isChecked() else None,
+            eyebrow_score_threshold=(
+                self.eyebrow_threshold.value() if self.eyebrow_threshold_checkbox.isChecked() else None
+            ),
         )
 
     def _on_run(self) -> None:
@@ -395,13 +413,25 @@ class FeatureMaskPanel(QGroupBox):
             self.batch_bar.set_status(f"Batch done: {ok_count}/{total} saved. Failed: {names} (see console).")
         else:
             self.batch_bar.set_status(f"Batch done: {ok_count}/{total} saved.")
+        if ok_count:
+            self.batchMasksBaked.emit(self.batch_bar.output_dir())
 
 
 # ---------------------------------------------------------------------------
 # Step 2: apply a UV-space mask to any UV-space texture
 # ---------------------------------------------------------------------------
+def pair_masks_by_stem(texture_paths: List[str], mask_dir: str) -> List[Tuple[str, Optional[str]]]:
+    """Pairs each texture with the mask in ``mask_dir`` sharing its filename stem (case-
+    insensitive) — the naming BatchFeatureMaskWorker writes its per-texture masks with.
+    Textures with no matching mask get ``None``.
+    """
+    masks_by_stem = {os.path.splitext(os.path.basename(m))[0].lower(): m for m in list_images(mask_dir)}
+    return [(t, masks_by_stem.get(os.path.splitext(os.path.basename(t))[0].lower())) for t in texture_paths]
+
+
 class BatchSegmentWorker(QThread):
-    """Applies one fixed region mask to many textures. Mirrors matte_luminance_ui.BatchWorker's
+    """Applies a region mask to many textures — either one fixed mask for all of them, or a
+    per-texture mask (see pair_masks_by_stem). Mirrors matte_luminance_ui.BatchWorker's
     per-file try/except + progress-signal shape so both tabs' batch behavior stays consistent.
     """
 
@@ -411,26 +441,31 @@ class BatchSegmentWorker(QThread):
 
     def __init__(
         self,
-        input_paths: List[str],
-        mask_path: str,
+        jobs: List[Tuple[str, Optional[str]]],
         output_dir: str,
         parent: Optional[QWidget] = None,
     ) -> None:
+        """``jobs``: (texture_path, mask_path) pairs; a ``None`` mask is reported as a failure."""
         super().__init__(parent)
-        self.input_paths = input_paths
-        self.mask_path = mask_path
+        self.jobs = jobs
         self.output_dir = output_dir
 
     def run(self) -> None:
-        total = len(self.input_paths)
+        total = len(self.jobs)
         ok_count = 0
         failures: List[Tuple[str, str]] = []
-        for i, path in enumerate(self.input_paths, start=1):
+        for i, (path, mask_path) in enumerate(self.jobs, start=1):
             name = os.path.basename(path)
+            if mask_path is None:
+                reason = "no matching mask (same filename stem) in mask folder"
+                failures.append((name, reason))
+                print(f"[batch] skipped {name}: {reason}")
+                self.fileFailed.emit(i, total, name, reason)
+                continue
             try:
                 stem = os.path.splitext(name)[0]
                 output_path = os.path.join(self.output_dir, f"{stem}.png")
-                segment_texture(path, self.mask_path, output_path)
+                segment_texture(path, mask_path, output_path)
                 ok_count += 1
                 self.fileDone.emit(i, total, name)
             except Exception:
@@ -469,12 +504,21 @@ class SegmentPanel(QGroupBox):
         self.status.setWordWrap(True)
         form.addRow(self.status)
 
+        # Per-texture masks for batch runs (e.g. step 1's batch output folder). Left empty, the
+        # batch applies the single "Region mask" above to every texture instead.
+        self.mask_dir_edit = _path_row(
+            form, "Batch mask folder (optional)", "", root=self._root, parent=self, is_dir=True
+        )
+
         self.batch_bar = BatchBar(self._root, "Run batch")
         self.batch_bar.runRequested.connect(self._on_run_batch)
         form.addRow(self.batch_bar)
 
     def set_mask_path(self, path: str) -> None:
         self.mask_edit.setText(path)
+
+    def set_mask_dir(self, path: str) -> None:
+        self.mask_dir_edit.setText(path)
 
     def _on_run(self) -> None:
         texture = self.texture_edit.text().strip()
@@ -500,13 +544,18 @@ class SegmentPanel(QGroupBox):
         self.status.setText(f"Done. Saved to {output_path}")
         self.segmented.emit(output_path)
 
-    # -- batch: same mask, every texture in a folder -------------------------
+    # -- batch: every texture in a folder, with one shared mask or per-texture masks --------
     def _on_run_batch(self) -> None:
         mask = self.mask_edit.text().strip()
+        mask_dir = self.mask_dir_edit.text().strip()
         input_dir = self.batch_bar.input_dir()
         output_dir = self.batch_bar.output_dir()
-        if not mask or not os.path.isfile(mask):
-            QMessageBox.warning(self, "Batch", "Select a valid region mask (bake one above, or pick an existing file).")
+        if mask_dir:
+            if not os.path.isdir(mask_dir):
+                QMessageBox.warning(self, "Batch", "Select a valid mask folder, or clear it to use the single region mask.")
+                return
+        elif not mask or not os.path.isfile(mask):
+            QMessageBox.warning(self, "Batch", "Select a valid region mask or mask folder (bake one above, or pick an existing file).")
             return
         if not input_dir or not os.path.isdir(input_dir):
             QMessageBox.warning(self, "Batch", "Select a valid input folder.")
@@ -514,18 +563,34 @@ class SegmentPanel(QGroupBox):
         if not output_dir:
             QMessageBox.warning(self, "Batch", "Select an output folder.")
             return
+        # Outputs are named <texture stem>.png, exactly like the masks they're paired with —
+        # writing into the mask folder would overwrite each mask with its own segment.
+        if mask_dir and os.path.normcase(os.path.abspath(mask_dir)) == os.path.normcase(os.path.abspath(output_dir)):
+            QMessageBox.warning(self, "Batch", "Output folder must differ from the mask folder (outputs would overwrite the masks).")
+            return
 
         input_paths = list_images(input_dir)
         if not input_paths:
             QMessageBox.warning(self, "Batch", f"No images found in: {input_dir}")
             return
 
+        if mask_dir:
+            jobs = pair_masks_by_stem(input_paths, mask_dir)
+            if not any(m for _, m in jobs):
+                QMessageBox.warning(
+                    self, "Batch", f"No masks in {mask_dir} share a filename stem with the textures in {input_dir}."
+                )
+                return
+        else:
+            jobs = [(path, mask) for path in input_paths]
+
         os.makedirs(output_dir, exist_ok=True)
         self.batch_bar.set_running(True)
         self.run_btn.setEnabled(False)
-        self.batch_bar.set_status(f"Processing 0/{len(input_paths)}…")
+        self.mask_dir_edit.setEnabled(False)
+        self.batch_bar.set_status(f"Processing 0/{len(jobs)}…")
 
-        self._batch_worker = BatchSegmentWorker(input_paths, mask, output_dir, self)
+        self._batch_worker = BatchSegmentWorker(jobs, output_dir, self)
         self._batch_worker.fileDone.connect(self._on_batch_file_done)
         self._batch_worker.fileFailed.connect(self._on_batch_file_failed)
         self._batch_worker.batchFinished.connect(self._on_batch_finished)
@@ -540,6 +605,7 @@ class SegmentPanel(QGroupBox):
     def _on_batch_finished(self, ok_count: int, total: int, failures: List[Tuple[str, str]]) -> None:
         self.batch_bar.set_running(False)
         self.run_btn.setEnabled(True)
+        self.mask_dir_edit.setEnabled(True)
         if failures:
             names = ", ".join(name for name, _ in failures)
             self.batch_bar.set_status(f"Batch done: {ok_count}/{total} saved. Failed: {names} (see console).")
@@ -591,6 +657,7 @@ class TextureSegmentationTab(QWidget):
 
         self.feature_mask_panel.maskBaked.connect(self._on_mask_baked)
         self.feature_mask_panel.landmarksBaked.connect(self._on_landmarks_baked)
+        self.feature_mask_panel.batchMasksBaked.connect(self.segment_panel.set_mask_dir)
         self.segment_panel.segmented.connect(self._on_segmented)
 
     def _on_mask_baked(self, path: str) -> None:
